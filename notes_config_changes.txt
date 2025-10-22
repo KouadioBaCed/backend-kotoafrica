@@ -1,0 +1,5 @@
+Changes made to `backend/koto_africa/settings.py`:
+- Load environment variables using python-dotenv's load_dotenv from `backend/.env`.
+- Replaced hardcoded SECRET_KEY, DEBUG, ALLOWED_HOSTS with env-driven values.
+
+If python-dotenv is not installed, run: pip install -r backend/requirements.txt

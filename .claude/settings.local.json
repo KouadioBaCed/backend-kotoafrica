@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//c/Users/lenovo/Downloads/koto_africa/project/**)",
+      "Bash(findstr:*)",
+      "Bash(python manage.py:*)",
+      "Bash(del db.sqlite3)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}

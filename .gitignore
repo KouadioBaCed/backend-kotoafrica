@@ -1,0 +1,2 @@
+# Ignore local env for backend
+.env
