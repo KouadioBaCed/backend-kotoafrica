@@ -1,5 +1,5 @@
 from django.core.management.base import BaseCommand
-from api.models import User, Supplier, Category, Product, Order, OrderItem, Payment, Review
+from api.models import User, Supplier, Category, Product, Order, OrderItem, Payment, Review, LogisticsRate, ExchangeRate
 from django.utils import timezone
 
 
@@ -326,6 +326,58 @@ class Command(BaseCommand):
             client.set_password('password123')
             client.save()
             self.stdout.write(f'Created client: {client.username}')
+
+        # Create Logistics Rates
+        logistics_rates_data = [
+            {
+                'shipping_method': 'air_rapide',
+                'rate_per_kg': 17000.00,
+                'rate_per_m3': None,
+                'min_days': 10,
+                'max_days': 17,
+                'is_active': True,
+            },
+            {
+                'shipping_method': 'air_express',
+                'rate_per_kg': 27000.00,
+                'rate_per_m3': None,
+                'min_days': 3,
+                'max_days': 8,
+                'is_active': True,
+            },
+            {
+                'shipping_method': 'sea_no_motor',
+                'rate_per_kg': None,
+                'rate_per_m3': 220000.00,
+                'min_days': 40,
+                'max_days': 70,
+                'is_active': True,
+            },
+            {
+                'shipping_method': 'sea_with_motor',
+                'rate_per_kg': None,
+                'rate_per_m3': 260000.00,
+                'min_days': 40,
+                'max_days': 70,
+                'is_active': True,
+            },
+        ]
+
+        for rate_data in logistics_rates_data:
+            rate, created = LogisticsRate.objects.get_or_create(
+                shipping_method=rate_data['shipping_method'],
+                defaults=rate_data
+            )
+            if created:
+                self.stdout.write(f'Created logistics rate: {rate.get_shipping_method_display()}')
+
+        # Create Exchange Rate
+        exchange_rate, created = ExchangeRate.objects.get_or_create(
+            is_active=True,
+            defaults={'usd_to_fcfa': 661.28}
+        )
+        if created:
+            self.stdout.write(f'Created exchange rate: {exchange_rate}')
 
         self.stdout.write(self.style.SUCCESS('Database seeded successfully!'))
         self.stdout.write(f'Created {Category.objects.count()} categories')

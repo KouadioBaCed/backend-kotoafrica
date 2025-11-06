@@ -1102,14 +1102,14 @@ class LogisticsRateViewSet(viewsets.ModelViewSet):
     ordering = ['shipping_method']
 
     def get_permissions(self):
-        """Allow read access to all authenticated users, but only admins can modify"""
-        if self.action in ['list', 'retrieve']:
-            permission_classes = [IsAuthenticated]
+        """Allow read access to all users, but only authenticated admins can modify"""
+        if self.action in ['list', 'retrieve', 'all_rates']:
+            permission_classes = [AllowAny]
         else:
-            permission_classes = [IsAuthenticated]  # Add admin check here if needed
+            permission_classes = [IsAuthenticated]  # Only authenticated users can modify
         return [permission() for permission in permission_classes]
 
-    @action(detail=False, methods=['get'])
+    @action(detail=False, methods=['get'], permission_classes=[AllowAny])
     def all_rates(self, request):
         """Get all active logistics rates with exchange rate"""
         try:
@@ -1137,14 +1137,14 @@ class ExchangeRateViewSet(viewsets.ModelViewSet):
     ordering = ['-created_at']
 
     def get_permissions(self):
-        """Allow read access to all authenticated users, but only admins can modify"""
+        """Allow read access to all users, but only authenticated admins can modify"""
         if self.action in ['list', 'retrieve', 'current']:
-            permission_classes = [IsAuthenticated]
+            permission_classes = [AllowAny]
         else:
-            permission_classes = [IsAuthenticated]  # Add admin check here if needed
+            permission_classes = [IsAuthenticated]  # Only authenticated users can modify
         return [permission() for permission in permission_classes]
 
-    @action(detail=False, methods=['get'])
+    @action(detail=False, methods=['get'], permission_classes=[AllowAny])
     def current(self, request):
         """Get the current active exchange rate"""
         try:
