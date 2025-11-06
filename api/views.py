@@ -344,9 +344,42 @@ class PaymentViewSet(viewsets.ModelViewSet):
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
         self.perform_create(serializer)
+
+        # Mettre à jour le payment_status de la commande
+        payment = serializer.instance
+        self.update_order_payment_status(payment.order)
+
         headers = self.get_success_headers(serializer.data)
         logger.info(f'Paiement créé avec succès: {serializer.data}')
         return Response(serializer.data, status=status.HTTP_201_CREATED, headers=headers)
+
+    def update_order_payment_status(self, order):
+        """
+        Met à jour le payment_status de la commande en fonction des paiements complétés
+        """
+        from django.db.models import Sum
+
+        # Calculer le montant total payé (seulement les paiements complétés)
+        total_paid = order.payments.filter(
+            status='completed'
+        ).aggregate(Sum('amount'))['amount__sum'] or 0
+
+        # Mettre à jour paid_amount
+        order.paid_amount = total_paid
+
+        # Déterminer le payment_status
+        if total_paid == 0:
+            order.payment_status = 'pending'
+        elif total_paid < order.total:
+            order.payment_status = 'partial'
+        else:
+            order.payment_status = 'completed'
+
+        order.save()
+
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.info(f'Order {order.tracking_number}: paid_amount={total_paid}, payment_status={order.payment_status}')
 
 
 class ReviewViewSet(viewsets.ModelViewSet):
@@ -486,6 +519,150 @@ class QuoteRequestViewSet(viewsets.ModelViewSet):
 
         return Response(stats)
 
+    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated])
+    def my_quotes(self, request):
+        """Get current user's quote requests"""
+        quotes = QuoteRequest.objects.filter(user=request.user)
+        serializer = self.get_serializer(quotes, many=True)
+        return Response(serializer.data)
+
+    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated])
+    def accept_quote(self, request, pk=None):
+        """Client accepts a validated quote"""
+        quote = self.get_object()
+
+        # Vérifier que c'est bien le devis de l'utilisateur
+        if quote.user != request.user:
+            return Response(
+                {'error': 'Vous n\'êtes pas autorisé à accepter ce devis'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
+        # Vérifier que le devis a été validé et a un prix
+        if quote.status != 'quoted':
+            return Response(
+                {'error': 'Ce devis n\'a pas encore été validé par l\'administrateur'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        if not quote.quoted_price:
+            return Response(
+                {'error': 'Le prix du devis n\'a pas encore été défini'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # Passer le devis en statut "accepté"
+        quote.status = 'accepted'
+        quote.save()
+
+        serializer = self.get_serializer(quote)
+        return Response({
+            'message': 'Devis accepté avec succès',
+            'quote': serializer.data
+        })
+
+    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated])
+    def pay_quote(self, request, pk=None):
+        """Process payment for an accepted quote"""
+        quote = self.get_object()
+
+        # Vérifier que c'est bien le devis de l'utilisateur
+        if quote.user != request.user:
+            return Response(
+                {'error': 'Vous n\'êtes pas autorisé à payer ce devis'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
+        # Vérifier que le devis a été accepté
+        if quote.status != 'accepted':
+            return Response(
+                {'error': 'Vous devez d\'abord accepter le devis'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # Vérifier que le devis n'a pas déjà été payé
+        if quote.payment_status == 'paid':
+            return Response(
+                {'error': 'Ce devis a déjà été payé'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # Récupérer les données de paiement
+        payment_mode = request.data.get('payment_mode', 'full')  # 'full' ou 'partial'
+        payment_method = request.data.get('payment_method')
+        shipping_address = request.data.get('shipping_address', {})
+
+        if not payment_method:
+            return Response(
+                {'error': 'Méthode de paiement requise'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # Créer la commande basée sur le devis
+        order = Order.objects.create(
+            user=request.user,
+            shipping_address=shipping_address.get('address', ''),
+            shipping_city=shipping_address.get('city', ''),
+            shipping_country=shipping_address.get('country', ''),
+            phone=quote.whatsapp,
+            total=float(quote.quoted_price),
+            subtotal=float(quote.quoted_price),
+            shipping_cost=0.00,
+            paid_amount=0.00,
+            payment_status='pending'
+        )
+
+        # Créer un item de commande pour le devis
+        OrderItem.objects.create(
+            order=order,
+            product=None,  # Pas de produit lié, c'est un devis personnalisé
+            quantity=quote.quantity,
+            price=float(quote.quoted_price) / quote.quantity,  # Prix unitaire
+            custom_description=f"Devis personnalisé: {quote.description}"
+        )
+
+        # Calculer le montant à payer selon le mode
+        total = float(quote.quoted_price)
+        amount_to_pay = round(total if payment_mode == 'full' else total * 0.5, 2)
+        remaining_amount = round(total - amount_to_pay, 2)
+
+        # Créer le premier paiement (acompte ou paiement total)
+        payment = Payment.objects.create(
+            order=order,
+            amount=amount_to_pay,
+            payment_type='deposit',
+            payment_method=payment_method,
+            status='completed'  # Considéré comme complété une fois l'action lancée
+        )
+
+        # Si paiement partiel, créer un deuxième paiement pour le solde
+        if payment_mode == 'partial' and remaining_amount > 0:
+            Payment.objects.create(
+                order=order,
+                amount=remaining_amount,
+                payment_type='balance',
+                payment_method='cash',  # À la livraison = espèces
+                status='pending'
+            )
+
+        # Mettre à jour le statut de paiement de la commande
+        order.paid_amount = amount_to_pay
+        order.payment_status = 'completed' if payment_mode == 'full' else 'partial'
+        order.save()
+
+        # Lier le devis à la commande et marquer comme payé
+        quote.order = order
+        quote.payment_status = 'paid'
+        quote.save()
+
+        return Response({
+            'message': 'Paiement effectué avec succès',
+            'order_id': order.id,
+            'payment_id': payment.id,
+            'amount_paid': amount_to_pay,
+            'remaining_amount': remaining_amount if payment_mode == 'partial' else 0
+        }, status=status.HTTP_201_CREATED)
+
 
 # Authentication Views
 @api_view(['POST'])
@@ -614,6 +791,14 @@ def send_otp_view(request):
             'success': False,
             'message': 'Objectif invalide'
         }, status=status.HTTP_400_BAD_REQUEST)
+
+    # For password reset, check if user exists
+    if purpose == 'password_reset':
+        if not User.objects.filter(email=email).exists():
+            return Response({
+                'success': False,
+                'message': 'Aucun compte trouvé avec cet email'
+            }, status=status.HTTP_404_NOT_FOUND)
 
     # Rate limiting: max 3 OTP per hour per email
     one_hour_ago = timezone.now() - timedelta(hours=1)

@@ -19,13 +19,11 @@ SECRET_KEY = os.getenv('DJANGO_SECRET_KEY', 'django-insecure-koto-africa-secret-
 DEBUG = os.getenv('DJANGO_DEBUG', 'True').lower() in ('1', 'true', 'yes')
 
 # Allowed hosts can be set as a comma-separated list in DJANGO_ALLOWED_HOSTS
-# raw_allowed = os.getenv('DJANGO_ALLOWED_HOSTS', '*')
-# if raw_allowed.strip() == '*':
-#     ALLOWED_HOSTS = ['*']
-# else:
-#     ALLOWED_HOSTS = [h.strip() for h in raw_allowed.split(',') if h.strip()]
-
-ALLOWED_HOSTS = ['217.76.62.41', 'kotoafrica.com']
+raw_allowed = os.getenv('DJANGO_ALLOWED_HOSTS', '*')
+if raw_allowed.strip() == '*':
+    ALLOWED_HOSTS = ['*']
+else:
+    ALLOWED_HOSTS = [h.strip() for h in raw_allowed.split(',') if h.strip()]
 
 # Application definition
 INSTALLED_APPS = [

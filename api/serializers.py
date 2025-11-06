@@ -244,8 +244,9 @@ class QuoteRequestSerializer(serializers.ModelSerializer):
         model = QuoteRequest
         fields = ['id', 'full_name', 'whatsapp', 'description', 'color',
                   'quantity', 'shoe_size', 'clothing_size', 'gender', 'photo',
-                  'status', 'notes', 'created_at', 'updated_at']
-        read_only_fields = ['id', 'created_at', 'updated_at']
+                  'status', 'notes', 'user', 'quoted_price', 'payment_status', 'order',
+                  'created_at', 'updated_at']
+        read_only_fields = ['id', 'created_at', 'updated_at', 'payment_status', 'order']
 
 
 class QuoteRequestCreateSerializer(serializers.ModelSerializer):

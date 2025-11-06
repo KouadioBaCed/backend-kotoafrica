@@ -68,10 +68,27 @@ class ReviewAdmin(admin.ModelAdmin):
 
 @admin.register(QuoteRequest)
 class QuoteRequestAdmin(admin.ModelAdmin):
-    list_display = ['full_name', 'whatsapp', 'gender', 'quantity', 'status', 'created_at']
-    list_filter = ['status', 'gender', 'created_at']
+    list_display = ['full_name', 'whatsapp', 'gender', 'quantity', 'status', 'quoted_price', 'payment_status', 'created_at']
+    list_filter = ['status', 'payment_status', 'gender', 'created_at']
     search_fields = ['full_name', 'whatsapp', 'description']
-    readonly_fields = ['created_at', 'updated_at']
+    readonly_fields = ['created_at', 'updated_at', 'payment_status', 'order']
+    fieldsets = (
+        ('Informations client', {
+            'fields': ('full_name', 'whatsapp', 'user')
+        }),
+        ('Détails du devis', {
+            'fields': ('description', 'color', 'quantity', 'shoe_size', 'clothing_size', 'gender', 'photo')
+        }),
+        ('Gestion du devis', {
+            'fields': ('status', 'notes', 'quoted_price')
+        }),
+        ('Paiement', {
+            'fields': ('payment_status', 'order')
+        }),
+        ('Dates', {
+            'fields': ('created_at', 'updated_at')
+        }),
+    )
 
 
 @admin.register(LogisticsRate)

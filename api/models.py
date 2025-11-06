@@ -312,6 +312,17 @@ class QuoteRequest(models.Model):
     photo = models.ImageField(upload_to='quote_requests/', blank=True, null=True)
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='pending')
     notes = models.TextField(blank=True)
+
+    # Champs pour la gestion des paiements
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='quote_requests', null=True, blank=True)
+    quoted_price = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True, help_text="Prix du devis en USD")
+    payment_status = models.CharField(
+        max_length=20,
+        choices=[('unpaid', 'Non payé'), ('paid', 'Payé')],
+        default='unpaid'
+    )
+    order = models.ForeignKey('Order', on_delete=models.SET_NULL, null=True, blank=True, related_name='source_quote')
+
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
