@@ -19,11 +19,13 @@ SECRET_KEY = os.getenv('DJANGO_SECRET_KEY', 'django-insecure-koto-africa-secret-
 DEBUG = os.getenv('DJANGO_DEBUG', 'True').lower() in ('1', 'true', 'yes')
 
 # Allowed hosts can be set as a comma-separated list in DJANGO_ALLOWED_HOSTS
-raw_allowed = os.getenv('DJANGO_ALLOWED_HOSTS', '*')
-if raw_allowed.strip() == '*':
-    ALLOWED_HOSTS = ['*']
-else:
-    ALLOWED_HOSTS = [h.strip() for h in raw_allowed.split(',') if h.strip()]
+# raw_allowed = os.getenv('DJANGO_ALLOWED_HOSTS', '*')
+# if raw_allowed.strip() == '*':
+#     ALLOWED_HOSTS = ['*']
+# else:
+#     ALLOWED_HOSTS = [h.strip() for h in raw_allowed.split(',') if h.strip()]
+
+ALLOWED_HOSTS = ['217.76.62.41', 'kotoafrica.com']
 
 # Application definition
 INSTALLED_APPS = [
@@ -180,3 +182,23 @@ CSRF_TRUSTED_ORIGINS = [
 
 
 CORS_ALLOW_CREDENTIALS = True
+
+# ============================================================
+# Email Configuration for OTP
+# ============================================================
+# DEVELOPMENT MODE: Les emails s'affichent dans la console Django
+EMAIL_BACKEND = 'django.core.mail.backends.console.EmailBackend'
+DEFAULT_FROM_EMAIL = 'KÔTO AFRICA <nnoaci@gmail.com>'
+
+# Pour la production avec Gmail, décommentez ces lignes et configurez le mot de passe :
+# EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'
+# EMAIL_HOST = 'smtp.gmail.com'
+# EMAIL_PORT = 587
+# EMAIL_USE_TLS = True
+# EMAIL_HOST_USER = 'nnoaci@gmail.com'
+# EMAIL_HOST_PASSWORD = os.getenv('EMAIL_HOST_PASSWORD', '')  # Mot de passe d'application Gmail
+# DEFAULT_FROM_EMAIL = 'KÔTO AFRICA <nnoaci@gmail.com>'
+
+# OTP Configuration
+OTP_EXPIRY_MINUTES = 5
+OTP_LENGTH = 6

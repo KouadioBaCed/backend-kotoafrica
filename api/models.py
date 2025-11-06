@@ -187,7 +187,14 @@ class Order(models.Model):
 class OrderItem(models.Model):
     """Order items"""
     order = models.ForeignKey(Order, on_delete=models.CASCADE, related_name='items')
-    product = models.ForeignKey(Product, on_delete=models.CASCADE)
+    product = models.ForeignKey(Product, on_delete=models.CASCADE, null=True, blank=True)
+
+    # Informations du produit (pour les produits externes/statiques)
+    product_name = models.CharField(max_length=500, blank=True)
+    product_image = models.TextField(blank=True)  # URL de l'image
+    product_url = models.TextField(blank=True)  # URL du produit (ex: AliExpress)
+    product_description = models.TextField(blank=True)
+
     quantity = models.IntegerField(validators=[MinValueValidator(1)])
     price = models.DecimalField(max_digits=10, decimal_places=2)
 
@@ -195,7 +202,9 @@ class OrderItem(models.Model):
         db_table = 'order_items'
 
     def __str__(self):
-        return f"{self.quantity}x {self.product.name}"
+        if self.product:
+            return f"{self.quantity}x {self.product.name}"
+        return f"{self.quantity}x {self.product_name}"
 
 
 class Payment(models.Model):
@@ -242,7 +251,15 @@ class Review(models.Model):
     ]
 
     user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='reviews')
-    product = models.ForeignKey(Product, on_delete=models.CASCADE, related_name='reviews')
+    # Product can be null for static/external products
+    product = models.ForeignKey(Product, on_delete=models.CASCADE, related_name='reviews', null=True, blank=True)
+
+    # For static/external products (when product is null)
+    product_external_id = models.CharField(max_length=255, blank=True, null=True)  # ID from external source
+    product_name = models.CharField(max_length=500, blank=True, null=True)
+    product_image = models.TextField(blank=True, null=True)  # URL de l'image
+    product_url = models.TextField(blank=True, null=True)  # URL du produit
+
     rating = models.IntegerField(validators=[MinValueValidator(1), MaxValueValidator(5)])
     comment = models.TextField()
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='pending')
@@ -254,10 +271,10 @@ class Review(models.Model):
     class Meta:
         db_table = 'reviews'
         ordering = ['-created_at']
-        unique_together = ['user', 'product']
 
     def __str__(self):
-        return f"Review by {self.user.username} for {self.product.name}"
+        product_name = self.product.name if self.product else self.product_name
+        return f"Review by {self.user.username} for {product_name}"
 
     def save(self, *args, **kwargs):
         # Sync is_approved with status for backward compatibility
@@ -304,3 +321,130 @@ class QuoteRequest(models.Model):
 
     def __str__(self):
         return f"Quote request from {self.full_name} - {self.description[:50]}"
+
+
+class OTPVerification(models.Model):
+    """OTP Verification for email verification"""
+    PURPOSE_CHOICES = [
+        ('registration', 'Registration'),
+        ('password_reset', 'Password Reset'),
+    ]
+
+    email = models.EmailField()
+    otp = models.CharField(max_length=6)
+    purpose = models.CharField(max_length=20, choices=PURPOSE_CHOICES)
+    created_at = models.DateTimeField(auto_now_add=True)
+    expires_at = models.DateTimeField()
+    is_verified = models.BooleanField(default=False)
+    verification_token = models.CharField(max_length=200, unique=True, null=True, blank=True)
+    attempts = models.IntegerField(default=0)
+
+    class Meta:
+        db_table = 'otp_verifications'
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['email', 'purpose', 'is_verified']),
+            models.Index(fields=['email', 'created_at']),
+        ]
+
+    def is_expired(self):
+        from django.utils import timezone
+        return timezone.now() > self.expires_at
+
+    def save(self, *args, **kwargs):
+        if not self.expires_at:
+            from django.utils import timezone
+            from datetime import timedelta
+            self.expires_at = timezone.now() + timedelta(minutes=5)
+        super().save(*args, **kwargs)
+
+    @staticmethod
+    def generate_otp():
+        """Generate a 6-digit OTP"""
+        import random
+        import string
+        return ''.join(random.choices(string.digits, k=6))
+
+    def __str__(self):
+        return f"{self.email} - {self.purpose} - {self.otp}"
+
+
+class LogisticsRate(models.Model):
+    """Logistics shipping rates configuration"""
+    SHIPPING_METHOD_CHOICES = [
+        ('air_rapide', 'Aérien Rapide'),
+        ('air_express', 'Aérien Express'),
+        ('sea_no_motor', 'Maritime sans Moteur'),
+        ('sea_with_motor', 'Maritime avec Moteur'),
+    ]
+
+    shipping_method = models.CharField(
+        max_length=20,
+        choices=SHIPPING_METHOD_CHOICES,
+        unique=True,
+        help_text='Type de transport'
+    )
+    rate_per_kg = models.DecimalField(
+        max_digits=10,
+        decimal_places=2,
+        null=True,
+        blank=True,
+        validators=[MinValueValidator(0)],
+        help_text='Tarif par kilogramme (pour transport aérien, en FCFA)'
+    )
+    rate_per_m3 = models.DecimalField(
+        max_digits=10,
+        decimal_places=2,
+        null=True,
+        blank=True,
+        validators=[MinValueValidator(0)],
+        help_text='Tarif par mètre cube (pour transport maritime, en FCFA)'
+    )
+    min_days = models.IntegerField(
+        validators=[MinValueValidator(1)],
+        help_text='Délai minimum de livraison en jours'
+    )
+    max_days = models.IntegerField(
+        validators=[MinValueValidator(1)],
+        help_text='Délai maximum de livraison en jours'
+    )
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'logistics_rates'
+        ordering = ['shipping_method']
+        verbose_name = 'Tarif Logistique'
+        verbose_name_plural = 'Tarifs Logistiques'
+
+    def __str__(self):
+        return f"{self.get_shipping_method_display()}"
+
+
+class ExchangeRate(models.Model):
+    """Currency exchange rate (USD to FCFA)"""
+    usd_to_fcfa = models.DecimalField(
+        max_digits=10,
+        decimal_places=2,
+        validators=[MinValueValidator(0)],
+        help_text='Taux de change: 1 USD = X FCFA'
+    )
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'exchange_rates'
+        ordering = ['-created_at']
+        verbose_name = 'Taux de Change'
+        verbose_name_plural = 'Taux de Change'
+
+    def __str__(self):
+        return f"1 USD = {self.usd_to_fcfa} FCFA"
+
+    @classmethod
+    def get_current_rate(cls):
+        """Get the currently active exchange rate"""
+        rate = cls.objects.filter(is_active=True).first()
+        return rate.usd_to_fcfa if rate else 661.28  # Fallback to default

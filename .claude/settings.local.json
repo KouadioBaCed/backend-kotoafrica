@@ -4,7 +4,11 @@
       "Read(//c/Users/lenovo/Downloads/koto_africa/project/**)",
       "Bash(findstr:*)",
       "Bash(python manage.py:*)",
-      "Bash(del db.sqlite3)"
+      "Bash(del db.sqlite3)",
+      "Bash(dir:*)",
+      "Bash(npm run build:*)",
+      "Bash(del \"C:\\Users\\lenovo\\Downloads\\koto_africa\\project\\src\\components\\admin\\AllReviewsManagement.tsx\")",
+      "Bash(timeout:*)"
     ],
     "deny": [],
     "ask": []

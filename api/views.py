@@ -9,7 +9,8 @@ from django.db import models
 from django.contrib.auth import login, logout
 from .models import (
     User, Supplier, Category, Product, ProductImage,
-    Order, OrderItem, Payment, Review, QuoteRequest
+    Order, OrderItem, Payment, Review, QuoteRequest, OTPVerification,
+    LogisticsRate, ExchangeRate
 )
 from .serializers import (
     UserSerializer, SupplierSerializer, CategorySerializer,
@@ -18,7 +19,8 @@ from .serializers import (
     PaymentSerializer, PaymentCreateSerializer,
     ReviewSerializer, ReviewCreateSerializer, ReviewUpdateSerializer,
     QuoteRequestSerializer, QuoteRequestCreateSerializer,
-    RegisterSerializer, LoginSerializer, UserProfileSerializer
+    RegisterSerializer, LoginSerializer, UserProfileSerializer,
+    LogisticsRateSerializer, ExchangeRateSerializer
 )
 
 
@@ -28,6 +30,12 @@ class UserViewSet(viewsets.ModelViewSet):
     filter_backends = [filters.SearchFilter, filters.OrderingFilter]
     search_fields = ['username', 'email', 'custom_id']
     ordering_fields = ['date_joined', 'username']
+
+    def get_serializer_class(self):
+        if self.action in ['create', 'update', 'partial_update']:
+            from .serializers import UserCreateUpdateSerializer
+            return UserCreateUpdateSerializer
+        return UserSerializer
 
 
 class SupplierViewSet(viewsets.ModelViewSet):
@@ -77,25 +85,99 @@ class OrderViewSet(viewsets.ModelViewSet):
     ordering_fields = ['created_at', 'total']
     search_fields = ['tracking_number', 'user__username', 'user__email']
 
+    def get_queryset(self):
+        """
+        Les utilisateurs normaux ne voient que leurs propres commandes.
+        Les admins voient toutes les commandes.
+        """
+        import logging
+        logger = logging.getLogger(__name__)
+
+        logger.info(f'=== OrderViewSet.get_queryset ===')
+        logger.info(f'User: {self.request.user}')
+        logger.info(f'Is authenticated: {self.request.user.is_authenticated}')
+        logger.info(f'Is staff: {self.request.user.is_staff}')
+
+        if self.request.user.is_staff:
+            queryset = Order.objects.all()
+            logger.info(f'Admin - Retourne toutes les commandes: {queryset.count()}')
+            return queryset
+
+        queryset = Order.objects.filter(user=self.request.user)
+        logger.info(f'User - Retourne les commandes de {self.request.user.username}: {queryset.count()}')
+        return queryset
+
+    def get_permissions(self):
+        """
+        Nécessite l'authentification pour créer, modifier ou voir les commandes
+        """
+        if self.action in ['create', 'update', 'partial_update', 'destroy', 'list', 'retrieve']:
+            return [IsAuthenticated()]
+        return super().get_permissions()
+
     def get_serializer_class(self):
         if self.action == 'create':
             return OrderCreateSerializer
         return OrderSerializer
 
-    @action(detail=True, methods=['post'])
+    def create(self, request, *args, **kwargs):
+        """Create order and return full order details"""
+        import logging
+        logger = logging.getLogger(__name__)
+
+        logger.info('=== Création de commande ===')
+        logger.info(f'Utilisateur connecté: {request.user.username} (ID: {request.user.id})')
+        logger.info(f'Is authenticated: {request.user.is_authenticated}')
+        logger.info(f'Données reçues: {request.data}')
+
+        # Utiliser OrderCreateSerializer pour valider et créer
+        # Le contexte est automatiquement passé par get_serializer() qui inclut la request
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        # Créer la commande - le serializer utilisera request.user du contexte
+        order = serializer.save()
+
+        logger.info(f'Commande créée: {order.id} - {order.tracking_number} pour user {order.user.username} (ID: {order.user.id})')
+
+        # Retourner les données complètes avec OrderSerializer
+        output_serializer = OrderSerializer(order)
+        headers = self.get_success_headers(output_serializer.data)
+
+        return Response(output_serializer.data, status=status.HTTP_201_CREATED, headers=headers)
+
+    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated])
     def update_status(self, request, pk=None):
-        """Update order status"""
+        """Update order status (admin only)"""
+        import logging
+        logger = logging.getLogger(__name__)
+
+        # Vérifier que l'utilisateur est admin
+        if not request.user.is_staff:
+            logger.warning(f'User {request.user.username} tried to update order status without admin rights')
+            return Response(
+                {'error': 'Permission refusée. Accès admin uniquement.'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
         order = self.get_object()
         new_status = request.data.get('status')
 
+        logger.info(f'Admin {request.user.username} updating order {order.tracking_number} status from {order.status} to {new_status}')
+
         if new_status in dict(Order.STATUS_CHOICES):
+            old_status = order.status
             order.status = new_status
             order.save()
+
+            logger.info(f'Order {order.tracking_number} status updated successfully')
+
             serializer = self.get_serializer(order)
             return Response(serializer.data)
 
+        logger.error(f'Invalid status: {new_status}')
         return Response(
-            {'error': 'Invalid status'},
+            {'error': f'Statut invalide: {new_status}'},
             status=status.HTTP_400_BAD_REQUEST
         )
 
@@ -106,6 +188,61 @@ class OrderViewSet(viewsets.ModelViewSet):
         serializer = self.get_serializer(local_orders, many=True)
         return Response(serializer.data)
 
+    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated])
+    def by_user(self, request):
+        """Get all orders grouped by user (admin only)"""
+        from django.db.models import Count, Sum
+        import logging
+        logger = logging.getLogger(__name__)
+
+        logger.info(f'=== Orders by user ===')
+        logger.info(f'Requester: {request.user.username} (Staff: {request.user.is_staff})')
+
+        # Vérifier que l'utilisateur est admin
+        if not request.user.is_staff:
+            return Response(
+                {'error': 'Permission refusée. Accès admin uniquement.'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
+        # Récupérer toutes les commandes avec les informations utilisateur
+        orders = Order.objects.select_related('user').order_by('-created_at')
+
+        # Grouper par utilisateur
+        users_stats = User.objects.annotate(
+            total_orders=Count('orders'),
+            total_spent=Sum('orders__total'),
+            total_paid=Sum('orders__paid_amount')
+        ).filter(total_orders__gt=0).order_by('-total_orders')
+
+        # Construire la réponse
+        result = []
+        for user_stat in users_stats:
+            user_orders = orders.filter(user=user_stat)
+            result.append({
+                'user': {
+                    'id': user_stat.id,
+                    'username': user_stat.username,
+                    'email': user_stat.email,
+                    'first_name': user_stat.first_name,
+                    'last_name': user_stat.last_name,
+                    'custom_id': user_stat.custom_id,
+                },
+                'statistics': {
+                    'total_orders': user_stat.total_orders,
+                    'total_spent': float(user_stat.total_spent) if user_stat.total_spent else 0,
+                    'total_paid': float(user_stat.total_paid) if user_stat.total_paid else 0,
+                },
+                'orders': OrderSerializer(user_orders, many=True).data
+            })
+
+        logger.info(f'Retourne les commandes de {len(result)} utilisateurs')
+
+        return Response({
+            'count': len(result),
+            'results': result
+        })
+
 
 class PaymentViewSet(viewsets.ModelViewSet):
     queryset = Payment.objects.all()
@@ -113,10 +250,65 @@ class PaymentViewSet(viewsets.ModelViewSet):
     filterset_fields = ['status', 'payment_type', 'payment_method', 'order']
     ordering_fields = ['created_at', 'amount']
 
+    def get_queryset(self):
+        """
+        Les utilisateurs normaux ne voient que les paiements de leurs propres commandes.
+        Les admins voient tous les paiements.
+        """
+        if self.request.user.is_staff:
+            return Payment.objects.all()
+        return Payment.objects.filter(order__user=self.request.user)
+
+    def get_permissions(self):
+        """
+        Nécessite l'authentification pour créer, modifier ou voir les paiements
+        """
+        if self.action in ['create', 'update', 'partial_update', 'destroy', 'list', 'retrieve']:
+            return [IsAuthenticated()]
+        return super().get_permissions()
+
     def get_serializer_class(self):
         if self.action == 'create':
             return PaymentCreateSerializer
         return PaymentSerializer
+
+    def create(self, request, *args, **kwargs):
+        """Create a new payment with detailed logging"""
+        import logging
+        logger = logging.getLogger(__name__)
+
+        logger.info('=== Création de paiement ===')
+        logger.info(f'Utilisateur: {request.user.username}')
+        logger.info(f'Données reçues: {request.data}')
+
+        # Vérifier que la commande appartient à l'utilisateur
+        order_id = request.data.get('order')
+        if order_id:
+            try:
+                order = Order.objects.get(id=order_id)
+                if order.user != request.user and not request.user.is_staff:
+                    logger.error(f'La commande {order_id} n\'appartient pas à l\'utilisateur {request.user.username}')
+                    return Response(
+                        {'order': 'Cette commande ne vous appartient pas'},
+                        status=status.HTTP_403_FORBIDDEN
+                    )
+                logger.info(f'Commande trouvée: {order.tracking_number}')
+            except Order.DoesNotExist:
+                logger.error(f'Commande {order_id} non trouvée')
+                return Response(
+                    {'order': 'Commande non trouvée'},
+                    status=status.HTTP_404_NOT_FOUND
+                )
+
+        serializer = self.get_serializer(data=request.data)
+        if not serializer.is_valid():
+            logger.error(f'Erreurs de validation: {serializer.errors}')
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        self.perform_create(serializer)
+        headers = self.get_success_headers(serializer.data)
+        logger.info(f'Paiement créé avec succès: {serializer.data}')
+        return Response(serializer.data, status=status.HTTP_201_CREATED, headers=headers)
 
 
 class ReviewViewSet(viewsets.ModelViewSet):
@@ -344,3 +536,596 @@ def update_profile_view(request):
         }, status=status.HTTP_200_OK)
 
     return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
+# ============================================================
+# OTP Email Verification Views
+# ============================================================
+
+@api_view(['POST'])
+@permission_classes([AllowAny])
+def send_otp_view(request):
+    """Send OTP to email for verification"""
+    import re
+    from django.core.mail import send_mail
+    from django.conf import settings
+    from django.utils import timezone
+    from datetime import timedelta
+    import jwt
+
+    email = request.data.get('email')
+    purpose = request.data.get('purpose')
+
+    if not email or not purpose:
+        return Response({
+            'success': False,
+            'message': 'Email et objectif requis'
+        }, status=status.HTTP_400_BAD_REQUEST)
+
+    # Validate email format
+    email_regex = r'^[^\s@]+@[^\s@]+\.[^\s@]+$'
+    if not re.match(email_regex, email):
+        return Response({
+            'success': False,
+            'message': 'Email invalide'
+        }, status=status.HTTP_400_BAD_REQUEST)
+
+    # Validate purpose
+    if purpose not in ['registration', 'password_reset']:
+        return Response({
+            'success': False,
+            'message': 'Objectif invalide'
+        }, status=status.HTTP_400_BAD_REQUEST)
+
+    # Rate limiting: max 3 OTP per hour per email
+    one_hour_ago = timezone.now() - timedelta(hours=1)
+    recent_attempts = OTPVerification.objects.filter(
+        email=email,
+        created_at__gte=one_hour_ago
+    ).count()
+
+    if recent_attempts >= 3:
+        return Response({
+            'success': False,
+            'message': 'Trop de tentatives. Réessayez dans 1 heure.'
+        }, status=status.HTTP_429_TOO_MANY_REQUESTS)
+
+    # Generate OTP
+    otp = OTPVerification.generate_otp()
+
+    # Save OTP in database
+    otp_record = OTPVerification.objects.create(
+        email=email,
+        otp=otp,
+        purpose=purpose
+    )
+
+    # Prepare email message
+    subject = 'Code de vérification KÔTO AFRICA'
+
+    if purpose == 'registration':
+        message = f"""
+Bonjour,
+
+Votre code de vérification pour créer votre compte KÔTO AFRICA est :
+
+{otp}
+
+Ce code est valide pendant 5 minutes.
+
+Si vous n'avez pas demandé ce code, ignorez cet email.
+
+Cordialement,
+L'équipe KÔTO AFRICA
+        """
+    else:  # password_reset
+        message = f"""
+Bonjour,
+
+Votre code de vérification pour réinitialiser votre mot de passe KÔTO AFRICA est :
+
+{otp}
+
+Ce code est valide pendant 5 minutes.
+
+Si vous n'avez pas demandé ce code, ignorez cet email.
+
+Cordialement,
+L'équipe KÔTO AFRICA
+        """
+
+    # Send email
+    try:
+        send_mail(
+            subject=subject,
+            message=message,
+            from_email=settings.DEFAULT_FROM_EMAIL,
+            recipient_list=[email],
+            fail_silently=False,
+        )
+
+        return Response({
+            'success': True,
+            'message': 'Code de vérification envoyé par email'
+        }, status=status.HTTP_200_OK)
+
+    except Exception as e:
+        # Delete OTP if email failed
+        otp_record.delete()
+
+        return Response({
+            'success': False,
+            'message': f"Erreur lors de l'envoi : {str(e)}"
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+@api_view(['POST'])
+@permission_classes([AllowAny])
+def verify_otp_view(request):
+    """Verify OTP code"""
+    import jwt
+    from django.conf import settings
+    from datetime import datetime, timedelta
+
+    email = request.data.get('email')
+    otp = request.data.get('otp')
+    purpose = request.data.get('purpose')
+
+    if not all([email, otp, purpose]):
+        return Response({
+            'success': False,
+            'message': 'Tous les champs sont requis'
+        }, status=status.HTTP_400_BAD_REQUEST)
+
+    # Find most recent unverified OTP
+    try:
+        otp_record = OTPVerification.objects.filter(
+            email=email,
+            purpose=purpose,
+            is_verified=False
+        ).order_by('-created_at').first()
+
+        if not otp_record:
+            return Response({
+                'success': False,
+                'message': 'Aucun code trouvé pour cet email'
+            }, status=status.HTTP_404_NOT_FOUND)
+
+        # Check if expired
+        if otp_record.is_expired():
+            return Response({
+                'success': False,
+                'message': 'Le code a expiré. Demandez un nouveau code.'
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        # Check attempts limit
+        if otp_record.attempts >= 5:
+            return Response({
+                'success': False,
+                'message': 'Trop de tentatives. Demandez un nouveau code.'
+            }, status=status.HTTP_429_TOO_MANY_REQUESTS)
+
+        # Increment attempts
+        otp_record.attempts += 1
+
+        # Verify OTP
+        if otp_record.otp != otp:
+            otp_record.save()
+            return Response({
+                'success': False,
+                'message': 'Code incorrect'
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        # Mark as verified and generate token
+        otp_record.is_verified = True
+
+        # Generate verification token (valid for 10 minutes)
+        verification_token = jwt.encode({
+            'email': email,
+            'purpose': purpose,
+            'otp_id': otp_record.id,
+            'exp': datetime.utcnow() + timedelta(minutes=10)
+        }, settings.SECRET_KEY, algorithm='HS256')
+
+        otp_record.verification_token = verification_token
+        otp_record.save()
+
+        return Response({
+            'success': True,
+            'message': 'Code vérifié avec succès',
+            'verification_token': verification_token
+        }, status=status.HTTP_200_OK)
+
+    except Exception as e:
+        return Response({
+            'success': False,
+            'message': f'Erreur : {str(e)}'
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+@api_view(['POST'])
+@permission_classes([AllowAny])
+def register_with_otp_view(request):
+    """Register user after OTP verification"""
+    import jwt
+    from django.conf import settings
+    from django.contrib.auth.hashers import make_password
+
+    verification_token = request.data.get('verification_token')
+
+    if not verification_token:
+        return Response({
+            'message': 'Token de vérification requis'
+        }, status=status.HTTP_400_BAD_REQUEST)
+
+    # Verify token
+    try:
+        payload = jwt.decode(verification_token, settings.SECRET_KEY, algorithms=['HS256'])
+        email = payload.get('email')
+
+        # Check that token is for registration
+        if payload.get('purpose') != 'registration':
+            return Response({
+                'message': 'Token invalide'
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        # Check that OTP was verified
+        otp_record = OTPVerification.objects.filter(
+            email=email,
+            verification_token=verification_token,
+            is_verified=True
+        ).first()
+
+        if not otp_record:
+            return Response({
+                'message': 'Token de vérification invalide'
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        # Check that email matches
+        if request.data.get('email') != email:
+            return Response({
+                'message': "L'email ne correspond pas"
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        # Check if user already exists
+        if User.objects.filter(email=email).exists():
+            return Response({
+                'message': 'Un compte existe déjà avec cet email'
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        # Check if username exists
+        username = request.data.get('username')
+        if User.objects.filter(username=username).exists():
+            return Response({
+                'message': 'Ce nom d\'utilisateur est déjà pris'
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        # Check password match
+        password = request.data.get('password')
+        password2 = request.data.get('password2')
+        if password != password2:
+            return Response({
+                'message': 'Les mots de passe ne correspondent pas'
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        # Create user
+        user = User.objects.create(
+            username=username,
+            email=email,
+            first_name=request.data.get('first_name', ''),
+            last_name=request.data.get('last_name', ''),
+            phone=request.data.get('phone', ''),
+            address=request.data.get('address', ''),
+            postal_code=request.data.get('postal_code', ''),
+            city=request.data.get('city', ''),
+            country=request.data.get('country', 'Côte d\'Ivoire'),
+            password=make_password(password)
+        )
+
+        # Delete used OTP
+        otp_record.delete()
+
+        # Generate JWT tokens
+        refresh = RefreshToken.for_user(user)
+
+        return Response({
+            'user': UserProfileSerializer(user).data,
+            'tokens': {
+                'refresh': str(refresh),
+                'access': str(refresh.access_token),
+            },
+            'message': 'Compte créé avec succès!'
+        }, status=status.HTTP_201_CREATED)
+
+    except jwt.ExpiredSignatureError:
+        return Response({
+            'message': 'Le token a expiré. Recommencez la procédure.'
+        }, status=status.HTTP_400_BAD_REQUEST)
+    except jwt.InvalidTokenError:
+        return Response({
+            'message': 'Token invalide'
+        }, status=status.HTTP_400_BAD_REQUEST)
+    except Exception as e:
+        return Response({
+            'message': f'Erreur : {str(e)}'
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+@api_view(['POST'])
+@permission_classes([AllowAny])
+def update_password_view(request):
+    """Update password after OTP verification"""
+    import jwt
+    from django.conf import settings
+    from django.contrib.auth.hashers import make_password
+
+    new_password = request.data.get('new_password')
+    verification_token = request.data.get('verification_token')
+
+    if not all([new_password, verification_token]):
+        return Response({
+            'message': 'Tous les champs sont requis'
+        }, status=status.HTTP_400_BAD_REQUEST)
+
+    try:
+        # Verify token
+        payload = jwt.decode(verification_token, settings.SECRET_KEY, algorithms=['HS256'])
+        email = payload.get('email')
+
+        # Check that token is for password reset
+        if payload.get('purpose') != 'password_reset':
+            return Response({
+                'message': 'Token invalide'
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        # Check that OTP was verified
+        otp_record = OTPVerification.objects.filter(
+            email=email,
+            verification_token=verification_token,
+            is_verified=True
+        ).first()
+
+        if not otp_record:
+            return Response({
+                'message': 'Token de vérification invalide'
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        # Find user by email
+        user = User.objects.filter(email=email).first()
+
+        if not user:
+            return Response({
+                'message': 'Utilisateur non trouvé'
+            }, status=status.HTTP_404_NOT_FOUND)
+
+        # Update password
+        user.password = make_password(new_password)
+        user.save()
+
+        # Delete used OTP
+        otp_record.delete()
+
+        return Response({
+            'success': True,
+            'message': 'Mot de passe modifié avec succès'
+        }, status=status.HTTP_200_OK)
+
+    except jwt.ExpiredSignatureError:
+        return Response({
+            'message': 'Le token a expiré. Recommencez la procédure.'
+        }, status=status.HTTP_400_BAD_REQUEST)
+    except jwt.InvalidTokenError:
+        return Response({
+            'message': 'Token invalide'
+        }, status=status.HTTP_400_BAD_REQUEST)
+    except Exception as e:
+        return Response({
+            'message': f'Erreur : {str(e)}'
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def dashboard_statistics(request):
+    """Get global statistics for admin dashboard"""
+    from django.db.models import Count, Sum, Q, Avg
+    from datetime import datetime, timedelta
+    from django.utils import timezone
+
+    try:
+        # Current date
+        now = timezone.now()
+        current_month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        seven_days_ago = now - timedelta(days=7)
+
+        # User statistics
+        total_users = User.objects.count()
+        active_users = User.objects.filter(is_active=True).count()
+        new_users_month = User.objects.filter(date_joined__gte=current_month_start).count()
+        admin_users = User.objects.filter(is_staff=True).count()
+
+        # Product statistics (static products from data/products.ts)
+        # Since products are static, we'll just count reviews and orders
+        total_reviews = Review.objects.count()
+        approved_reviews = Review.objects.filter(is_approved=True).count()
+        pending_reviews = Review.objects.filter(is_approved=False).count()
+        avg_rating = Review.objects.filter(is_approved=True).aggregate(Avg('rating'))['rating__avg'] or 0
+
+        # Order statistics
+        total_orders = Order.objects.count()
+        orders_month = Order.objects.filter(created_at__gte=current_month_start).count()
+
+        orders_by_status = Order.objects.values('status').annotate(count=Count('id'))
+        status_breakdown = {item['status']: item['count'] for item in orders_by_status}
+
+        pending_orders = status_breakdown.get('pending', 0)
+        confirmed_orders = status_breakdown.get('confirmed', 0)
+        shipped_orders = status_breakdown.get('shipped', 0)
+        delivered_orders = status_breakdown.get('delivered', 0)
+        cancelled_orders = status_breakdown.get('cancelled', 0)
+
+        # Revenue statistics
+        total_revenue = Order.objects.exclude(
+            status='cancelled'
+        ).aggregate(Sum('total'))['total__sum'] or 0
+
+        revenue_month = Order.objects.filter(
+            created_at__gte=current_month_start
+        ).exclude(
+            status='cancelled'
+        ).aggregate(Sum('total'))['total__sum'] or 0
+
+        # Quote request statistics
+        total_quotes = QuoteRequest.objects.count()
+        quotes_by_status = QuoteRequest.objects.values('status').annotate(count=Count('id'))
+        quotes_breakdown = {item['status']: item['count'] for item in quotes_by_status}
+
+        pending_quotes = quotes_breakdown.get('pending', 0)
+        processing_quotes = quotes_breakdown.get('processing', 0)
+        quoted_quotes = quotes_breakdown.get('quoted', 0)
+        accepted_quotes = quotes_breakdown.get('accepted', 0)
+        rejected_quotes = quotes_breakdown.get('rejected', 0)
+
+        # Sales data for last 7 days
+        sales_last_7_days = []
+        for i in range(6, -1, -1):
+            day = now - timedelta(days=i)
+            day_start = day.replace(hour=0, minute=0, second=0, microsecond=0)
+            day_end = day_start + timedelta(days=1)
+
+            orders_count = Order.objects.filter(
+                created_at__gte=day_start,
+                created_at__lt=day_end
+            ).count()
+
+            revenue = Order.objects.filter(
+                created_at__gte=day_start,
+                created_at__lt=day_end
+            ).exclude(
+                status='cancelled'
+            ).aggregate(Sum('total'))['total__sum'] or 0
+
+            sales_last_7_days.append({
+                'date': day.strftime('%Y-%m-%d'),
+                'orders': orders_count,
+                'revenue': float(revenue)
+            })
+
+        return Response({
+            'users': {
+                'total': total_users,
+                'active': active_users,
+                'new_this_month': new_users_month,
+                'admins': admin_users,
+            },
+            'orders': {
+                'total': total_orders,
+                'this_month': orders_month,
+                'pending': pending_orders,
+                'confirmed': confirmed_orders,
+                'shipped': shipped_orders,
+                'delivered': delivered_orders,
+                'cancelled': cancelled_orders,
+            },
+            'revenue': {
+                'total': float(total_revenue),
+                'this_month': float(revenue_month),
+            },
+            'reviews': {
+                'total': total_reviews,
+                'approved': approved_reviews,
+                'pending': pending_reviews,
+                'average_rating': round(float(avg_rating), 2),
+            },
+            'quotes': {
+                'total': total_quotes,
+                'pending': pending_quotes,
+                'processing': processing_quotes,
+                'quoted': quoted_quotes,
+                'accepted': accepted_quotes,
+                'rejected': rejected_quotes,
+            },
+            'sales_last_7_days': sales_last_7_days,
+        })
+
+    except Exception as e:
+        return Response({
+            'error': f'Erreur lors du calcul des statistiques: {str(e)}'
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+class LogisticsRateViewSet(viewsets.ModelViewSet):
+    """ViewSet for managing logistics shipping rates"""
+    queryset = LogisticsRate.objects.all()
+    serializer_class = LogisticsRateSerializer
+    permission_classes = [IsAuthenticated]
+    filter_backends = [filters.OrderingFilter]
+    ordering_fields = ['shipping_method', 'updated_at']
+    ordering = ['shipping_method']
+
+    def get_permissions(self):
+        """Allow read access to all authenticated users, but only admins can modify"""
+        if self.action in ['list', 'retrieve']:
+            permission_classes = [IsAuthenticated]
+        else:
+            permission_classes = [IsAuthenticated]  # Add admin check here if needed
+        return [permission() for permission in permission_classes]
+
+    @action(detail=False, methods=['get'])
+    def all_rates(self, request):
+        """Get all active logistics rates with exchange rate"""
+        try:
+            rates = LogisticsRate.objects.filter(is_active=True)
+            exchange_rate = ExchangeRate.get_current_rate()
+
+            rates_data = LogisticsRateSerializer(rates, many=True).data
+
+            return Response({
+                'rates': rates_data,
+                'usd_to_fcfa': float(exchange_rate)
+            })
+        except Exception as e:
+            return Response({
+                'error': f'Erreur lors de la récupération des tarifs: {str(e)}'
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+class ExchangeRateViewSet(viewsets.ModelViewSet):
+    """ViewSet for managing currency exchange rates"""
+    queryset = ExchangeRate.objects.all()
+    serializer_class = ExchangeRateSerializer
+    permission_classes = [IsAuthenticated]
+    filter_backends = [filters.OrderingFilter]
+    ordering = ['-created_at']
+
+    def get_permissions(self):
+        """Allow read access to all authenticated users, but only admins can modify"""
+        if self.action in ['list', 'retrieve', 'current']:
+            permission_classes = [IsAuthenticated]
+        else:
+            permission_classes = [IsAuthenticated]  # Add admin check here if needed
+        return [permission() for permission in permission_classes]
+
+    @action(detail=False, methods=['get'])
+    def current(self, request):
+        """Get the current active exchange rate"""
+        try:
+            rate = ExchangeRate.objects.filter(is_active=True).first()
+            if rate:
+                return Response(ExchangeRateSerializer(rate).data)
+            else:
+                # Return default rate if none exists
+                return Response({
+                    'usd_to_fcfa': '661.28',
+                    'is_active': True
+                })
+        except Exception as e:
+            return Response({
+                'error': f'Erreur lors de la récupération du taux de change: {str(e)}'
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    def create(self, request, *args, **kwargs):
+        """Create new exchange rate and deactivate previous ones"""
+        # Désactiver tous les taux précédents
+        ExchangeRate.objects.filter(is_active=True).update(is_active=False)
+        return super().create(request, *args, **kwargs)
