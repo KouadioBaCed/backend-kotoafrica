@@ -13,7 +13,7 @@ from .models import (
     LogisticsRate, ExchangeRate
 )
 from .serializers import (
-    UserSerializer, SupplierSerializer, CategorySerializer,
+    UserCreateUpdateSerializer, UserSerializer, SupplierSerializer, CategorySerializer,
     ProductSerializer, ProductCreateSerializer,
     OrderSerializer, OrderCreateSerializer,
     PaymentSerializer, PaymentCreateSerializer,
@@ -27,15 +27,53 @@ from .serializers import (
 class UserViewSet(viewsets.ModelViewSet):
     queryset = User.objects.all()
     serializer_class = UserSerializer
+    permission_classes = [IsAuthenticated]
     filter_backends = [filters.SearchFilter, filters.OrderingFilter]
     search_fields = ['username', 'email', 'custom_id']
     ordering_fields = ['date_joined', 'username']
 
     def get_serializer_class(self):
-        if self.action in ['create', 'update', 'partial_update']:
+        if self.action in ['create', 'update', 'partial_update', 'me']:
             from .serializers import UserCreateUpdateSerializer
             return UserCreateUpdateSerializer
         return UserSerializer
+
+    @action(detail=False, methods=['get', 'patch'], permission_classes=[IsAuthenticated])
+    def me(self, request):
+        """Get or update current user profile"""
+        import logging
+        logger = logging.getLogger(__name__)
+
+        logger.info(f'=== /users/me/ endpoint called ===')
+        logger.info(f'Method: {request.method}')
+        logger.info(f'User: {request.user.username} (ID: {request.user.id})')
+
+        if request.method == 'GET':
+            serializer = UserSerializer(request.user)
+            return Response(serializer.data)
+        elif request.method == 'PATCH':
+            logger.info(f'Data received: {request.data}')
+
+            # Use UserCreateUpdateSerializer for updates but exclude password
+            data = request.data.copy()
+            data.pop('password', None)  # Don't allow password change here
+            data.pop('is_staff', None)  # Don't allow is_staff change
+            data.pop('is_active', None)  # Don't allow is_active change
+            data.pop('user_type', None)  # Don't allow user_type change
+
+            logger.info(f'Data after filtering: {data}')
+
+            serializer = UserCreateUpdateSerializer(request.user, data=data, partial=True)
+            if serializer.is_valid():
+                logger.info('Serializer is valid, saving...')
+                user = serializer.save()
+                # Return full user data with UserSerializer
+                output_serializer = UserSerializer(user)
+                logger.info(f'User updated successfully: {output_serializer.data}')
+                return Response(output_serializer.data)
+
+            logger.error(f'Validation errors: {serializer.errors}')
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
 
 class SupplierViewSet(viewsets.ModelViewSet):
