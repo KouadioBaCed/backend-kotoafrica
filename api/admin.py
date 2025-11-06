@@ -11,7 +11,7 @@ class UserAdmin(admin.ModelAdmin):
     list_display = ['username', 'email', 'user_type', 'custom_id', 'date_joined']
     list_filter = ['user_type', 'is_active', 'date_joined']
     search_fields = ['username', 'email', 'custom_id']
-
+ 
 
 @admin.register(Supplier)
 class SupplierAdmin(admin.ModelAdmin):
