@@ -124,7 +124,7 @@ REST_FRAMEWORK = {
     'DEFAULT_PERMISSION_CLASSES': [
         'rest_framework.permissions.AllowAny',
     ],
-    'DEFAULT_PAGINATION_CLASS': 'rest_framework.pagination.PageNumberPagination',
+    'DEFAULT_PAGINATION_CLASS': 'koto_africa.pagination.CustomPageNumberPagination',
     'PAGE_SIZE': 20,
     'DEFAULT_AUTHENTICATION_CLASSES': [
         'rest_framework_simplejwt.authentication.JWTAuthentication',
@@ -171,32 +171,54 @@ CORS_ALLOWED_ORIGINS = [
     "http://localhost:5174",
     "http://localhost:5175",
     "http://localhost:5176",
+    "https://kotoafrica.com",
+    "https://www.kotoafrica.com",
+    "https://api.kotoafrica.com",
 ]
 
+# Autoriser toutes les origines pour les fichiers media (images)
+CORS_ALLOW_ALL_ORIGINS = True
+
+# Headers CORS supplementaires pour permettre le chargement des images
+CORS_ALLOW_HEADERS = [
+    'accept',
+    'accept-encoding',
+    'authorization',
+    'content-type',
+    'dnt',
+    'origin',
+    'user-agent',
+    'x-csrftoken',
+    'x-requested-with',
+]
+
+CORS_EXPOSE_HEADERS = [
+    'content-type',
+    'content-length',
+]
 
 CSRF_TRUSTED_ORIGINS = [
-    "https://shows-broader-clarke-hindu.trycloudflare.com",
+    "https://kotoafrica.com",
+    "https://www.kotoafrica.com",
+    "https://api.kotoafrica.com",
 ]
-
 
 CORS_ALLOW_CREDENTIALS = True
 
 # ============================================================
-# Email Configuration for OTP
+# Email Configuration for OTP (Gmail SMTP)
 # ============================================================
-# DEVELOPMENT MODE: Les emails s'affichent dans la console Django
-EMAIL_BACKEND = 'django.core.mail.backends.console.EmailBackend'
-DEFAULT_FROM_EMAIL = 'KÔTO AFRICA <nnoaci@gmail.com>'
-
-# Pour la production avec Gmail, décommentez ces lignes et configurez le mot de passe :
-# EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'
-# EMAIL_HOST = 'smtp.gmail.com'
-# EMAIL_PORT = 587
-# EMAIL_USE_TLS = True
-# EMAIL_HOST_USER = 'nnoaci@gmail.com'
-# EMAIL_HOST_PASSWORD = os.getenv('EMAIL_HOST_PASSWORD', '')  # Mot de passe d'application Gmail
-# DEFAULT_FROM_EMAIL = 'KÔTO AFRICA <nnoaci@gmail.com>'
+EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'
+EMAIL_HOST = 'smtp.gmail.com'
+EMAIL_PORT = 587
+EMAIL_USE_TLS = True
+EMAIL_HOST_USER = os.getenv('EMAIL_HOST_USER', 'kkotoafrica@gmail.com')
+EMAIL_HOST_PASSWORD = os.getenv('EMAIL_HOST_PASSWORD', '')
+DEFAULT_FROM_EMAIL = os.getenv('DEFAULT_FROM_EMAIL', 'KÔTO AFRICA <kkotoafrica@gmail.com>')
 
 # OTP Configuration
 OTP_EXPIRY_MINUTES = 5
 OTP_LENGTH = 6
+
+# Upload size limit (50MB for videos)
+DATA_UPLOAD_MAX_MEMORY_SIZE = 52428800

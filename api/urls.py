@@ -3,18 +3,20 @@ from rest_framework.routers import DefaultRouter
 from rest_framework_simplejwt.views import TokenRefreshView
 from .views import (
     UserViewSet, SupplierViewSet, CategoryViewSet,
-    ProductViewSet, OrderViewSet, PaymentViewSet, ReviewViewSet,
+    ProvenanceViewSet, ProductViewSet, OrderViewSet, PaymentViewSet, ReviewViewSet,
     QuoteRequestViewSet, LogisticsRateViewSet, ExchangeRateViewSet,
     register_view, login_view, logout_view,
     user_profile_view, update_profile_view,
     send_otp_view, verify_otp_view, register_with_otp_view, update_password_view,
-    dashboard_statistics
+    dashboard_statistics,
+    dashboard_export_excel
 )
 
 router = DefaultRouter()
 router.register(r'users', UserViewSet)
 router.register(r'suppliers', SupplierViewSet)
 router.register(r'categories', CategoryViewSet)
+router.register(r'provenances', ProvenanceViewSet)
 router.register(r'products', ProductViewSet)
 router.register(r'orders', OrderViewSet)
 router.register(r'payments', PaymentViewSet)
@@ -42,4 +44,5 @@ urlpatterns = [
 
     # Dashboard statistics
     path('dashboard/statistics/', dashboard_statistics, name='dashboard_statistics'),
+    path('dashboard/export/', dashboard_export_excel, name='dashboard_export_excel'),
 ]

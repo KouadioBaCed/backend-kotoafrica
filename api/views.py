@@ -3,17 +3,21 @@ from rest_framework.decorators import action, api_view, permission_classes
 from rest_framework.response import Response
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.authtoken.models import Token
+from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 from rest_framework_simplejwt.tokens import RefreshToken
 from django_filters.rest_framework import DjangoFilterBackend
-from django.db import models
+from django.db.models import Count, Q
+from django.utils import timezone
+from datetime import timedelta
 from django.contrib.auth import login, logout
 from .models import (
-    User, Supplier, Category, Product, ProductImage,
+    User, Supplier, Category, Provenance, Product, ProductImage,
     Order, OrderItem, Payment, Review, QuoteRequest, OTPVerification,
     LogisticsRate, ExchangeRate
 )
 from .serializers import (
     UserCreateUpdateSerializer, UserSerializer, SupplierSerializer, CategorySerializer,
+    ProvenanceSerializer,
     ProductSerializer, ProductCreateSerializer,
     OrderSerializer, OrderCreateSerializer,
     PaymentSerializer, PaymentCreateSerializer,
@@ -87,33 +91,162 @@ class SupplierViewSet(viewsets.ModelViewSet):
 class CategoryViewSet(viewsets.ModelViewSet):
     queryset = Category.objects.all()
     serializer_class = CategorySerializer
+    filter_backends = [filters.SearchFilter, filters.OrderingFilter]
+    search_fields = ['name']
+    ordering_fields = ['name', 'created_at']
+    ordering = ['name']
+
+    def get_permissions(self):
+        if self.action in ['list', 'retrieve', 'products']:
+            return [AllowAny()]
+        return [IsAuthenticated()]
+
+    @action(detail=True, methods=['get'])
+    def products(self, request, pk=None):
+        """Get all products for a given category"""
+        category = self.get_object()
+        products = Product.objects.filter(category=category, status__in=['active', 'promotion'])
+        serializer = ProductSerializer(products, many=True)
+        return Response(serializer.data)
+
+
+class ProvenanceViewSet(viewsets.ModelViewSet):
+    queryset = Provenance.objects.all()
+    serializer_class = ProvenanceSerializer
+    filter_backends = [filters.SearchFilter, filters.OrderingFilter]
+    search_fields = ['name']
+    ordering_fields = ['name', 'created_at']
+    ordering = ['name']
+
+    def get_permissions(self):
+        if self.action in ['list', 'retrieve', 'products']:
+            return [AllowAny()]
+        return [IsAuthenticated()]
+
+    @action(detail=True, methods=['get'])
+    def products(self, request, pk=None):
+        """Get all products for a given provenance"""
+        provenance = self.get_object()
+        products = Product.objects.filter(origin=provenance, status__in=['active', 'promotion'])
+        serializer = ProductSerializer(products, many=True)
+        return Response(serializer.data)
 
 
 class ProductViewSet(viewsets.ModelViewSet):
-    queryset = Product.objects.filter(is_active=True)
+    queryset = Product.objects.all()
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
-    filterset_fields = ['origin', 'category', 'supplier']
+    filterset_fields = ['origin', 'category', 'supplier', 'status']
     search_fields = ['name', 'description', 'country']
     ordering_fields = ['price', 'rating', 'created_at']
+    parser_classes = [MultiPartParser, FormParser, JSONParser]
+
+    def get_permissions(self):
+        if self.action in ['list', 'retrieve', 'popular', 'featured']:
+            return [AllowAny()]
+        return [IsAuthenticated()]
 
     def get_serializer_class(self):
         if self.action in ['create', 'update', 'partial_update']:
             return ProductCreateSerializer
         return ProductSerializer
 
+    def get_queryset(self):
+        # Annoter chaque produit avec le nombre de commandes (hors annulées/remboursées)
+        qs = Product.objects.annotate(
+            order_count=Count(
+                'orderitem',
+                filter=Q(orderitem__order__status__in=['pending', 'confirmed', 'shipped', 'available', 'delivered'])
+            )
+        )
+        if self.request.user.is_authenticated and self.request.user.is_staff:
+            return qs
+        return qs.filter(status__in=['active', 'promotion'])
+
     @action(detail=False, methods=['get'])
     def popular(self, request):
-        """Get popular products"""
-        products = self.get_queryset().order_by('-rating', '-reviews_count')[:10]
-        serializer = self.get_serializer(products, many=True)
+        """Get popular products (3+ orders)"""
+        products = Product.objects.filter(
+            status__in=['active', 'promotion']
+        ).annotate(
+            order_count=Count(
+                'orderitem',
+                filter=Q(orderitem__order__status__in=['pending', 'confirmed', 'shipped', 'available', 'delivered'])
+            )
+        ).filter(order_count__gte=3).order_by('-order_count', '-rating')[:10]
+        serializer = ProductSerializer(products, many=True)
         return Response(serializer.data)
 
     @action(detail=False, methods=['get'])
     def featured(self, request):
         """Get featured products"""
-        products = self.get_queryset().filter(rating__gte=4.5)[:8]
-        serializer = self.get_serializer(products, many=True)
+        products = Product.objects.filter(status__in=['active', 'promotion'], rating__gte=4.5)[:8]
+        serializer = ProductSerializer(products, many=True)
         return Response(serializer.data)
+
+    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated])
+    def upload_images(self, request, pk=None):
+        """Upload images for a product"""
+        product = self.get_object()
+        images = request.FILES.getlist('images')
+
+        if not images:
+            return Response({'error': 'Aucune image fournie'}, status=status.HTTP_400_BAD_REQUEST)
+
+        has_primary = product.images.filter(is_primary=True).exists()
+        created_images = []
+
+        for i, image_file in enumerate(images):
+            is_primary = (not has_primary and i == 0)
+            img = ProductImage.objects.create(
+                product=product,
+                image=image_file,
+                is_primary=is_primary,
+            )
+            created_images.append({
+                'id': img.id,
+                'image': img.image.url,
+                'is_primary': img.is_primary,
+            })
+
+        return Response(created_images, status=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=['delete'], url_path='delete_image/(?P<image_id>[^/.]+)', permission_classes=[IsAuthenticated])
+    def delete_image(self, request, pk=None, image_id=None):
+        """Delete an image from a product"""
+        product = self.get_object()
+        try:
+            image = product.images.get(id=image_id)
+        except ProductImage.DoesNotExist:
+            return Response({'error': 'Image non trouvée'}, status=status.HTTP_404_NOT_FOUND)
+
+        # Delete the file from storage
+        if image.image:
+            image.image.delete(save=False)
+        image.delete()
+
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated])
+    def set_primary_image(self, request, pk=None):
+        """Set an image as the primary image for a product"""
+        product = self.get_object()
+        image_id = request.data.get('image_id')
+
+        if not image_id:
+            return Response({'error': 'image_id requis'}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            image = product.images.get(id=image_id)
+        except ProductImage.DoesNotExist:
+            return Response({'error': 'Image non trouvée'}, status=status.HTTP_404_NOT_FOUND)
+
+        # Reset all images to non-primary
+        product.images.update(is_primary=False)
+        # Set the chosen image as primary
+        image.is_primary = True
+        image.save()
+
+        return Response({'message': 'Image principale mise à jour', 'image_id': image.id})
 
 
 class OrderViewSet(viewsets.ModelViewSet):
@@ -126,7 +259,8 @@ class OrderViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         """
         Les utilisateurs normaux ne voient que leurs propres commandes.
-        Les admins voient toutes les commandes.
+        Les admins voient toutes les commandes, sauf si ?mine=true est passé
+        (pour que l'admin puisse voir ses propres commandes en tant que client).
         """
         import logging
         logger = logging.getLogger(__name__)
@@ -136,7 +270,9 @@ class OrderViewSet(viewsets.ModelViewSet):
         logger.info(f'Is authenticated: {self.request.user.is_authenticated}')
         logger.info(f'Is staff: {self.request.user.is_staff}')
 
-        if self.request.user.is_staff:
+        mine = self.request.query_params.get('mine', '').lower() == 'true'
+
+        if self.request.user.is_staff and not mine:
             queryset = Order.objects.all()
             logger.info(f'Admin - Retourne toutes les commandes: {queryset.count()}')
             return queryset
@@ -219,6 +355,123 @@ class OrderViewSet(viewsets.ModelViewSet):
             status=status.HTTP_400_BAD_REQUEST
         )
 
+    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated])
+    def confirm_payment(self, request, pk=None):
+        """Admin confirme le paiement Wave reçu (1ère échéance)"""
+        if not request.user.is_staff:
+            return Response({'error': 'Permission refusée.'}, status=status.HTTP_403_FORBIDDEN)
+
+        order = self.get_object()
+        order.paid_amount = order.amount_due
+        order.status = 'confirmed'
+
+        if order.payment_mode == 'partial':
+            order.payment_status = 'partial'
+        else:
+            order.payment_status = 'completed'
+
+        order.save()
+
+        Payment.objects.create(
+            order=order,
+            amount=order.amount_due,
+            payment_type='deposit' if order.payment_mode == 'partial' else 'balance',
+            payment_method='wave',
+            status='completed',
+        )
+
+        serializer = self.get_serializer(order)
+        return Response(serializer.data)
+
+    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated])
+    def confirm_balance(self, request, pk=None):
+        """Admin confirme le paiement du solde restant (30%)"""
+        if not request.user.is_staff:
+            return Response({'error': 'Permission refusée.'}, status=status.HTTP_403_FORBIDDEN)
+
+        order = self.get_object()
+        if order.payment_status != 'partial':
+            return Response({'error': 'Cette commande n\'a pas de solde en attente.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        remaining = order.total - order.paid_amount
+        payment_method = request.data.get('payment_method', 'cash')
+        order.paid_amount = order.total
+        order.payment_status = 'completed'
+        order.save()
+
+        # Si un paiement de solde en attente existe (initié par le client), le marquer comme complété
+        pending_balance = Payment.objects.filter(
+            order=order,
+            payment_type='balance',
+            status='pending'
+        ).first()
+
+        if pending_balance:
+            pending_balance.status = 'completed'
+            pending_balance.payment_method = payment_method
+            pending_balance.save()
+        else:
+            Payment.objects.create(
+                order=order,
+                amount=remaining,
+                payment_type='balance',
+                payment_method=payment_method,
+                status='completed',
+            )
+
+        serializer = self.get_serializer(order)
+        return Response(serializer.data)
+
+    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated])
+    def initiate_balance_payment(self, request, pk=None):
+        """Client signale qu'il a initié le paiement du solde (30%) via Wave"""
+        import logging
+        logger = logging.getLogger(__name__)
+
+        order = self.get_object()
+
+        # Vérifier que c'est bien le propriétaire de la commande
+        if order.user != request.user and not request.user.is_staff:
+            return Response({'error': 'Permission refusée.'}, status=status.HTTP_403_FORBIDDEN)
+
+        if order.payment_status != 'partial':
+            return Response(
+                {'error': 'Cette commande n\'a pas de solde en attente.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # Vérifier qu'il n'y a pas déjà un paiement de solde en attente
+        existing_pending = Payment.objects.filter(
+            order=order,
+            payment_type='balance',
+            status='pending'
+        ).exists()
+
+        if existing_pending:
+            return Response(
+                {'message': 'Un paiement de solde est déjà en attente de confirmation.'},
+                status=status.HTTP_200_OK
+            )
+
+        remaining = order.total - order.paid_amount
+
+        # Créer un paiement en attente pour le solde
+        Payment.objects.create(
+            order=order,
+            amount=remaining,
+            payment_type='balance',
+            payment_method='wave',
+            status='pending',
+        )
+
+        logger.info(f'Balance payment initiated for order {order.tracking_number} - {remaining} FCFA via Wave')
+
+        serializer = self.get_serializer(order)
+        return Response({
+            'message': 'Paiement du solde initié. L\'équipe va confirmer la réception.',
+            'order': serializer.data
+        })
+
     @action(detail=False, methods=['get'])
     def local_products(self, request):
         """Get orders for local products only"""
@@ -244,7 +497,7 @@ class OrderViewSet(viewsets.ModelViewSet):
             )
 
         # Récupérer toutes les commandes avec les informations utilisateur
-        orders = Order.objects.select_related('user').order_by('-created_at')
+        orders = Order.objects.select_related('user').prefetch_related('items__product__images').order_by('-created_at')
 
         # Grouper par utilisateur
         users_stats = User.objects.annotate(
@@ -265,6 +518,7 @@ class OrderViewSet(viewsets.ModelViewSet):
                     'first_name': user_stat.first_name,
                     'last_name': user_stat.last_name,
                     'custom_id': user_stat.custom_id,
+                    'phone': user_stat.phone,
                 },
                 'statistics': {
                     'total_orders': user_stat.total_orders,
@@ -280,6 +534,34 @@ class OrderViewSet(viewsets.ModelViewSet):
             'count': len(result),
             'results': result
         })
+
+    def destroy(self, request, *args, **kwargs):
+        """Supprimer une commande (admin uniquement)"""
+        if not request.user.is_staff:
+            return Response(
+                {'error': 'Permission refusée. Accès admin uniquement.'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+        order = self.get_object()
+        order.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+    @action(detail=False, methods=['post'], permission_classes=[IsAuthenticated])
+    def bulk_delete(self, request):
+        """Supprimer plusieurs commandes (admin uniquement)"""
+        if not request.user.is_staff:
+            return Response(
+                {'error': 'Permission refusée. Accès admin uniquement.'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+        ids = request.data.get('ids', [])
+        if not ids:
+            return Response(
+                {'error': 'Aucun ID fourni.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        deleted_count, _ = Order.objects.filter(id__in=ids).delete()
+        return Response({'deleted': deleted_count})
 
 
 class PaymentViewSet(viewsets.ModelViewSet):
@@ -453,9 +735,9 @@ class ReviewViewSet(viewsets.ModelViewSet):
         stats = Review.objects.aggregate(
             total=Count('id'),
             average_rating=Avg('rating'),
-            approved=Count('id', filter=models.Q(status='approved')),
-            pending=Count('id', filter=models.Q(status='pending')),
-            rejected=Count('id', filter=models.Q(status='rejected'))
+            approved=Count('id', filter=Q(status='approved')),
+            pending=Count('id', filter=Q(status='pending')),
+            rejected=Count('id', filter=Q(status='rejected'))
         )
 
         # Rating distribution
@@ -510,11 +792,11 @@ class QuoteRequestViewSet(viewsets.ModelViewSet):
 
         stats = QuoteRequest.objects.aggregate(
             total=Count('id'),
-            pending=Count('id', filter=models.Q(status='pending')),
-            processing=Count('id', filter=models.Q(status='processing')),
-            quoted=Count('id', filter=models.Q(status='quoted')),
-            accepted=Count('id', filter=models.Q(status='accepted')),
-            rejected=Count('id', filter=models.Q(status='rejected'))
+            pending=Count('id', filter=Q(status='pending')),
+            processing=Count('id', filter=Q(status='processing')),
+            quoted=Count('id', filter=Q(status='quoted')),
+            accepted=Count('id', filter=Q(status='accepted')),
+            rejected=Count('id', filter=Q(status='rejected'))
         )
 
         return Response(stats)
@@ -1121,9 +1403,8 @@ def update_password_view(request):
                 'message': 'Utilisateur non trouvé'
             }, status=status.HTTP_404_NOT_FOUND)
 
-        # Update password
-        user.password = make_password(new_password)
-        user.save()
+        # Update password (use update() to avoid triggering custom_id generation)
+        User.objects.filter(pk=user.pk).update(password=make_password(new_password))
 
         # Delete used OTP
         otp_record.delete()
@@ -1156,10 +1437,26 @@ def dashboard_statistics(request):
     from django.utils import timezone
 
     try:
-        # Current date
+        # Current date + period filter
         now = timezone.now()
         current_month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
         seven_days_ago = now - timedelta(days=7)
+
+        period = request.GET.get('period', 'all')
+        period_start = None
+        if period == 'day':
+            period_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        elif period == 'week':
+            period_start = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+        elif period == 'month':
+            period_start = current_month_start
+        elif period == 'year':
+            period_start = now.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
+
+        # Base queryset for orders (filtered by period if needed)
+        base_orders = Order.objects.all()
+        if period_start:
+            base_orders = base_orders.filter(created_at__gte=period_start)
 
         # User statistics
         total_users = User.objects.count()
@@ -1167,36 +1464,68 @@ def dashboard_statistics(request):
         new_users_month = User.objects.filter(date_joined__gte=current_month_start).count()
         admin_users = User.objects.filter(is_staff=True).count()
 
-        # Product statistics (static products from data/products.ts)
-        # Since products are static, we'll just count reviews and orders
+        # Review statistics
         total_reviews = Review.objects.count()
         approved_reviews = Review.objects.filter(is_approved=True).count()
         pending_reviews = Review.objects.filter(is_approved=False).count()
         avg_rating = Review.objects.filter(is_approved=True).aggregate(Avg('rating'))['rating__avg'] or 0
 
-        # Order statistics
-        total_orders = Order.objects.count()
-        orders_month = Order.objects.filter(created_at__gte=current_month_start).count()
+        # Order statistics (filtered)
+        total_orders_count = base_orders.count()
+        orders_month = base_orders.filter(created_at__gte=current_month_start).count() if not period_start else total_orders_count
 
-        orders_by_status = Order.objects.values('status').annotate(count=Count('id'))
+        orders_by_status = base_orders.values('status').annotate(count=Count('id'))
         status_breakdown = {item['status']: item['count'] for item in orders_by_status}
 
         pending_orders = status_breakdown.get('pending', 0)
         confirmed_orders = status_breakdown.get('confirmed', 0)
         shipped_orders = status_breakdown.get('shipped', 0)
+        available_orders = status_breakdown.get('available', 0)
         delivered_orders = status_breakdown.get('delivered', 0)
         cancelled_orders = status_breakdown.get('cancelled', 0)
+        refunded_orders = status_breakdown.get('refunded', 0)
 
-        # Revenue statistics
-        total_revenue = Order.objects.exclude(
-            status='cancelled'
-        ).aggregate(Sum('total'))['total__sum'] or 0
+        # Revenue statistics (filtered, exclude cancelled and refunded)
+        active_orders = base_orders.exclude(status__in=['cancelled', 'refunded'])
+        total_revenue = active_orders.aggregate(Sum('total'))['total__sum'] or 0
 
-        revenue_month = Order.objects.filter(
+        revenue_month = active_orders.filter(
             created_at__gte=current_month_start
-        ).exclude(
-            status='cancelled'
-        ).aggregate(Sum('total'))['total__sum'] or 0
+        ).aggregate(Sum('total'))['total__sum'] or 0 if not period_start else float(total_revenue)
+
+        # Financial stats (filtered)
+        total_avances = active_orders.aggregate(Sum('paid_amount'))['paid_amount__sum'] or 0
+        total_reste = float(total_revenue) - float(total_avances)
+
+        refunded_qs = base_orders.filter(status='refunded')
+        cancelled_qs = base_orders.filter(status='cancelled')
+
+        # Cash (paiement total 100%)
+        cash_orders = active_orders.filter(payment_mode='total')
+        cash_stats = {
+            'count': cash_orders.count(),
+            'total': float(cash_orders.aggregate(Sum('total'))['total__sum'] or 0),
+        }
+
+        # Partiel (paiement 70%)
+        partial_orders = active_orders.filter(payment_mode='partial')
+        partial_paid = float(partial_orders.aggregate(Sum('paid_amount'))['paid_amount__sum'] or 0)
+        partial_total = float(partial_orders.aggregate(Sum('total'))['total__sum'] or 0)
+        partial_stats = {
+            'count': partial_orders.count(),
+            'total': partial_total,
+            'avance': partial_paid,
+            'reste': partial_total - partial_paid,
+        }
+
+        # Remboursement
+        refund_stats = {
+            'count': refunded_qs.count(),
+            'total': float(refunded_qs.aggregate(Sum('total'))['total__sum'] or 0),
+        }
+
+        # Total annulées (cancelled + refunded)
+        total_annulees = float((cancelled_qs | refunded_qs).aggregate(Sum('total'))['total__sum'] or 0)
 
         # Quote request statistics
         total_quotes = QuoteRequest.objects.count()
@@ -1225,7 +1554,7 @@ def dashboard_statistics(request):
                 created_at__gte=day_start,
                 created_at__lt=day_end
             ).exclude(
-                status='cancelled'
+                status__in=['cancelled', 'refunded']
             ).aggregate(Sum('total'))['total__sum'] or 0
 
             sales_last_7_days.append({
@@ -1241,18 +1570,27 @@ def dashboard_statistics(request):
                 'new_this_month': new_users_month,
                 'admins': admin_users,
             },
+            'period': period,
             'orders': {
-                'total': total_orders,
+                'total': total_orders_count,
                 'this_month': orders_month,
                 'pending': pending_orders,
                 'confirmed': confirmed_orders,
                 'shipped': shipped_orders,
+                'available': available_orders,
                 'delivered': delivered_orders,
                 'cancelled': cancelled_orders,
+                'refunded': refunded_orders,
             },
             'revenue': {
                 'total': float(total_revenue),
                 'this_month': float(revenue_month),
+                'total_avances': float(total_avances),
+                'reste_a_payer': float(total_reste),
+                'total_annulees': float(total_annulees),
+                'cash': cash_stats,
+                'partial': partial_stats,
+                'refunded': refund_stats,
             },
             'reviews': {
                 'total': total_reviews,
@@ -1275,6 +1613,260 @@ def dashboard_statistics(request):
         return Response({
             'error': f'Erreur lors du calcul des statistiques: {str(e)}'
         }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def dashboard_export_excel(request):
+    """Export dashboard data as Excel file"""
+    from django.db.models import Sum, Count
+    from datetime import timedelta
+    from django.utils import timezone
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from io import BytesIO
+    import django.http
+
+    if not request.user.is_staff:
+        return Response({'error': 'Permission refusée.'}, status=status.HTTP_403_FORBIDDEN)
+
+    now = timezone.now()
+    period = request.GET.get('period', 'all')
+    period_start = None
+    period_label = 'Toutes les périodes'
+
+    if period == 'day':
+        period_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        period_label = f"Aujourd'hui ({now.strftime('%d/%m/%Y')})"
+    elif period == 'week':
+        period_start = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+        period_label = f"Cette semaine (depuis {period_start.strftime('%d/%m/%Y')})"
+    elif period == 'month':
+        period_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        period_label = f"Ce mois ({now.strftime('%m/%Y')})"
+    elif period == 'year':
+        period_start = now.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
+        period_label = f"Cette année ({now.strftime('%Y')})"
+
+    base_orders = Order.objects.all()
+    if period_start:
+        base_orders = base_orders.filter(created_at__gte=period_start)
+
+    active_orders = base_orders.exclude(status__in=['cancelled', 'refunded'])
+    refunded_qs = base_orders.filter(status='refunded')
+    cancelled_qs = base_orders.filter(status='cancelled')
+    cash_orders = active_orders.filter(payment_mode='total')
+    partial_orders = active_orders.filter(payment_mode='partial')
+
+    wb = Workbook()
+    header_font = Font(bold=True, color='FFFFFF', size=12)
+    header_fill = PatternFill(start_color='1BAA70', end_color='1BAA70', fill_type='solid')
+    sub_header_font = Font(bold=True, size=11)
+    sub_header_fill = PatternFill(start_color='FFD835', end_color='FFD835', fill_type='solid')
+    money_format = '#,##0'
+    thin_border = Border(
+        left=Side(style='thin'), right=Side(style='thin'),
+        top=Side(style='thin'), bottom=Side(style='thin')
+    )
+
+    # === Feuille 1: Résumé comptable ===
+    ws = wb.active
+    ws.title = 'Comptabilité'
+    ws.column_dimensions['A'].width = 35
+    ws.column_dimensions['B'].width = 20
+    ws.column_dimensions['C'].width = 20
+
+    row = 1
+    ws.merge_cells('A1:C1')
+    ws['A1'] = f'KÔTO AFRICA - Comptabilité ({period_label})'
+    ws['A1'].font = Font(bold=True, size=14, color='4A2C2A')
+    ws['A1'].alignment = Alignment(horizontal='center')
+
+    # Compute all values upfront
+    ca = float(active_orders.aggregate(Sum('total'))['total__sum'] or 0)
+    encaisse = float(active_orders.aggregate(Sum('paid_amount'))['paid_amount__sum'] or 0)
+    cash_total = float(cash_orders.aggregate(Sum('total'))['total__sum'] or 0)
+    cash_paid = float(cash_orders.aggregate(Sum('paid_amount'))['paid_amount__sum'] or 0)
+    partial_total = float(partial_orders.aggregate(Sum('total'))['total__sum'] or 0)
+    partial_paid = float(partial_orders.aggregate(Sum('paid_amount'))['paid_amount__sum'] or 0)
+    refund_total = float(refunded_qs.aggregate(Sum('total'))['total__sum'] or 0)
+    cancel_total = float(cancelled_qs.aggregate(Sum('total'))['total__sum'] or 0)
+
+    ca_fill = PatternFill(start_color='1BAA70', end_color='1BAA70', fill_type='solid')
+    ca_font = Font(bold=True, color='FFFFFF', size=12)
+
+    # === Section 1: CHIFFRE D'AFFAIRES TOTAL ===
+    row = 3
+    ws.merge_cells('A3:C3')
+    cell = ws.cell(row=row, column=1, value="CHIFFRE D'AFFAIRES TOTAL")
+    cell.font = ca_font
+    cell.fill = ca_fill
+    cell.alignment = Alignment(horizontal='center')
+    cell.border = thin_border
+    for col_idx in range(2, 4):
+        ws.cell(row=row, column=col_idx).fill = ca_fill
+        ws.cell(row=row, column=col_idx).border = thin_border
+
+    row = 4
+    for col_idx, title in enumerate(['', 'Nombre', 'Montant (FCFA)'], 1):
+        cell = ws.cell(row=row, column=col_idx, value=title)
+        cell.font = Font(bold=True, size=10, color='666666')
+        cell.border = thin_border
+
+    row = 5
+    ws.cell(row=row, column=1, value="CA Total").font = Font(bold=True, size=12)
+    ws.cell(row=row, column=2, value=active_orders.count()).font = Font(bold=True, size=12)
+    c = ws.cell(row=row, column=3, value=ca)
+    c.number_format = money_format
+    c.font = Font(bold=True, size=12, color='1BAA70')
+
+    row = 6
+    ws.cell(row=row, column=1, value="   dont Cash (100%)").font = Font(size=10)
+    ws.cell(row=row, column=2, value=cash_orders.count())
+    c = ws.cell(row=row, column=3, value=cash_total)
+    c.number_format = money_format
+
+    row = 7
+    ws.cell(row=row, column=1, value="   dont Partiel (70%)").font = Font(size=10)
+    ws.cell(row=row, column=2, value=partial_orders.count())
+    c = ws.cell(row=row, column=3, value=partial_total)
+    c.number_format = money_format
+
+    row = 9
+    ws.cell(row=row, column=1, value='Total encaissé').font = Font(bold=True)
+    ws.cell(row=row, column=2, value=active_orders.count())
+    c = ws.cell(row=row, column=3, value=encaisse)
+    c.number_format = money_format
+    c.font = Font(bold=True, color='1BAA70')
+
+    row = 10
+    ws.cell(row=row, column=1, value='Reste à encaisser').font = Font(bold=True)
+    ws.cell(row=row, column=2, value=partial_orders.count())
+    c = ws.cell(row=row, column=3, value=ca - encaisse)
+    c.number_format = money_format
+    c.font = Font(bold=True, color='F97316')
+
+    # === Section 2: CASH (100%) ===
+    row = 12
+    for col_idx, title in enumerate(['CASH (100%)', 'Nombre', 'Montant (FCFA)'], 1):
+        cell = ws.cell(row=row, column=col_idx, value=title)
+        cell.font = sub_header_font
+        cell.fill = sub_header_fill
+        cell.border = thin_border
+
+    row = 13
+    ws.cell(row=row, column=1, value='Commandes payées 100%')
+    ws.cell(row=row, column=2, value=cash_orders.count())
+    c = ws.cell(row=row, column=3, value=cash_total)
+    c.number_format = money_format
+
+    row = 14
+    ws.cell(row=row, column=1, value='Montant encaissé')
+    c = ws.cell(row=row, column=3, value=cash_paid)
+    c.number_format = money_format
+
+    # === Section 3: PARTIEL (70%) ===
+    row = 16
+    partial_fill = PatternFill(start_color='F97316', end_color='F97316', fill_type='solid')
+    for col_idx, title in enumerate(['PARTIEL (70%)', 'Nombre', 'Montant (FCFA)'], 1):
+        cell = ws.cell(row=row, column=col_idx, value=title)
+        cell.font = Font(bold=True, size=11, color='FFFFFF')
+        cell.fill = partial_fill
+        cell.border = thin_border
+
+    row = 17
+    ws.cell(row=row, column=1, value='Commandes partielles')
+    ws.cell(row=row, column=2, value=partial_orders.count())
+    c = ws.cell(row=row, column=3, value=partial_total)
+    c.number_format = money_format
+
+    row = 18
+    ws.cell(row=row, column=1, value='Avances encaissées (70%)')
+    c = ws.cell(row=row, column=3, value=partial_paid)
+    c.number_format = money_format
+    c.font = Font(color='1BAA70')
+
+    row = 19
+    ws.cell(row=row, column=1, value='Reste à encaisser (30%)')
+    c = ws.cell(row=row, column=3, value=partial_total - partial_paid)
+    c.number_format = money_format
+    c.font = Font(bold=True, color='F97316')
+
+    # === Section 4: REMBOURSEMENTS ===
+    row = 21
+    refund_fill = PatternFill(start_color='EF4444', end_color='EF4444', fill_type='solid')
+    for col_idx, title in enumerate(['REMBOURSEMENTS', 'Nombre', 'Montant (FCFA)'], 1):
+        cell = ws.cell(row=row, column=col_idx, value=title)
+        cell.font = Font(bold=True, size=11, color='FFFFFF')
+        cell.fill = refund_fill
+        cell.border = thin_border
+
+    row = 22
+    ws.cell(row=row, column=1, value='Commandes remboursées')
+    ws.cell(row=row, column=2, value=refunded_qs.count())
+    c = ws.cell(row=row, column=3, value=refund_total)
+    c.number_format = money_format
+
+    # === Section 5: ANNULÉES ===
+    row = 23
+    ws.cell(row=row, column=1, value='Commandes annulées')
+    ws.cell(row=row, column=2, value=cancelled_qs.count())
+    c = ws.cell(row=row, column=3, value=cancel_total)
+    c.number_format = money_format
+
+    # Bordures pour toutes les cellules de données
+    for r in range(3, 24):
+        for c_col in range(1, 4):
+            cell = ws.cell(row=r, column=c_col)
+            if cell.border == Border():
+                cell.border = thin_border
+
+    # === Feuille 2: Détail des commandes ===
+    ws2 = wb.create_sheet('Détail commandes')
+    headers = ['N° Tracking', 'Date', 'Client', 'Statut', 'Mode paiement', 'Total (FCFA)', 'Payé (FCFA)', 'Reste (FCFA)']
+    col_widths = [18, 14, 25, 22, 16, 16, 16, 16]
+    for i, (h, w) in enumerate(zip(headers, col_widths), 1):
+        cell = ws2.cell(row=1, column=i, value=h)
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.border = thin_border
+        ws2.column_dimensions[chr(64 + i)].width = w
+
+    status_labels = {
+        'pending': 'En attente', 'confirmed': 'Confirmé en préparation',
+        'shipped': 'Expédié', 'available': 'Disponible à Abidjan',
+        'delivered': 'Livré', 'cancelled': 'Annulée', 'refunded': 'Remboursé',
+    }
+
+    for idx, order in enumerate(base_orders.select_related('user').order_by('-created_at'), 2):
+        total_val = float(order.total or 0)
+        paid_val = float(order.paid_amount or 0)
+        ws2.cell(row=idx, column=1, value=order.tracking_number).border = thin_border
+        ws2.cell(row=idx, column=2, value=order.created_at.strftime('%d/%m/%Y')).border = thin_border
+        ws2.cell(row=idx, column=3, value=f'{order.user.first_name} {order.user.last_name}'.strip() or order.user.username).border = thin_border
+        ws2.cell(row=idx, column=4, value=status_labels.get(order.status, order.status)).border = thin_border
+        ws2.cell(row=idx, column=5, value='Partiel 70%' if order.payment_mode == 'partial' else 'Total 100%').border = thin_border
+        c = ws2.cell(row=idx, column=6, value=total_val)
+        c.number_format = money_format
+        c.border = thin_border
+        c = ws2.cell(row=idx, column=7, value=paid_val)
+        c.number_format = money_format
+        c.border = thin_border
+        c = ws2.cell(row=idx, column=8, value=total_val - paid_val)
+        c.number_format = money_format
+        c.border = thin_border
+
+    output = BytesIO()
+    wb.save(output)
+    output.seek(0)
+
+    filename = f'koto_africa_comptabilite_{now.strftime("%Y%m%d")}.xlsx'
+    response = django.http.HttpResponse(
+        output.getvalue(),
+        content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+    )
+    response['Content-Disposition'] = f'attachment; filename="{filename}"'
+    return response
 
 
 class LogisticsRateViewSet(viewsets.ModelViewSet):

@@ -2,7 +2,7 @@ from rest_framework import serializers
 from django.contrib.auth import authenticate
 from django.contrib.auth.password_validation import validate_password
 from .models import (
-    User, Supplier, Category, Product, ProductImage,
+    User, Supplier, Category, Provenance, Product, ProductImage,
     Order, OrderItem, Payment, Review, QuoteRequest,
     LogisticsRate, ExchangeRate
 )
@@ -55,9 +55,27 @@ class SupplierSerializer(serializers.ModelSerializer):
 
 
 class CategorySerializer(serializers.ModelSerializer):
+    products_count = serializers.SerializerMethodField()
+
     class Meta:
         model = Category
-        fields = ['id', 'name', 'description', 'slug']
+        fields = ['id', 'name', 'slug', 'description', 'products_count', 'created_at', 'updated_at']
+        read_only_fields = ['id', 'created_at', 'updated_at']
+
+    def get_products_count(self, obj):
+        return obj.products.count()
+
+
+class ProvenanceSerializer(serializers.ModelSerializer):
+    products_count = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Provenance
+        fields = ['id', 'name', 'slug', 'description', 'products_count', 'created_at', 'updated_at']
+        read_only_fields = ['id', 'created_at', 'updated_at']
+
+    def get_products_count(self, obj):
+        return obj.products.count()
 
 
 class ProductImageSerializer(serializers.ModelSerializer):
@@ -69,20 +87,52 @@ class ProductImageSerializer(serializers.ModelSerializer):
 class ProductSerializer(serializers.ModelSerializer):
     supplier = SupplierSerializer(read_only=True)
     category = CategorySerializer(read_only=True)
+    origin = ProvenanceSerializer(read_only=True)
     images = ProductImageSerializer(many=True, read_only=True)
+    status_display = serializers.CharField(source='get_status_display', read_only=True)
+    order_count = serializers.IntegerField(read_only=True, default=0)
 
     class Meta:
         model = Product
         fields = ['id', 'supplier', 'category', 'name', 'description', 'price',
-                  'origin', 'country', 'stock', 'rating', 'reviews_count',
-                  'delivery_time', 'is_active', 'created_at', 'updated_at', 'images']
+                  'price_fcfa', 'old_price', 'old_price_fcfa',
+                  'marketing_price_fcfa', 'origin', 'country', 'stock', 'rating',
+                  'reviews_count', 'delivery_time', 'status', 'status_display',
+                  'is_active', 'video', 'created_at', 'updated_at', 'images',
+                  'order_count']
 
 
 class ProductCreateSerializer(serializers.ModelSerializer):
+    origin = serializers.PrimaryKeyRelatedField(queryset=Provenance.objects.all(), required=False, allow_null=True)
+    supplier = serializers.PrimaryKeyRelatedField(queryset=Supplier.objects.all(), required=False, allow_null=True)
+
     class Meta:
         model = Product
-        fields = ['category', 'name', 'description', 'price', 'origin',
-                  'country', 'stock', 'delivery_time', 'is_active']
+        fields = ['id', 'category', 'name', 'description', 'price', 'price_fcfa',
+                  'old_price', 'old_price_fcfa',
+                  'marketing_price_fcfa', 'origin', 'country', 'stock',
+                  'delivery_time', 'status', 'supplier', 'video']
+        read_only_fields = ['id']
+
+    def validate(self, data):
+        if data.get('status') == 'promotion':
+            old_price = data.get('old_price')
+            price = data.get('price')
+            if old_price is None:
+                raise serializers.ValidationError({
+                    'old_price': "L'ancien prix est requis pour un produit en promotion."
+                })
+            if price is not None and old_price <= price:
+                raise serializers.ValidationError({
+                    'old_price': "L'ancien prix doit être supérieur au prix actuel."
+                })
+            old_price_fcfa = data.get('old_price_fcfa')
+            price_fcfa = data.get('price_fcfa')
+            if old_price_fcfa is not None and price_fcfa is not None and old_price_fcfa <= price_fcfa:
+                raise serializers.ValidationError({
+                    'old_price_fcfa': "L'ancien prix FCFA doit être supérieur au prix actuel FCFA."
+                })
+        return data
 
 
 class OrderItemSerializer(serializers.ModelSerializer):
@@ -90,26 +140,35 @@ class OrderItemSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = OrderItem
-        fields = ['id', 'product', 'product_name', 'product_image', 'product_url', 'product_description', 'quantity', 'price']
+        fields = ['id', 'product', 'product_name', 'product_image', 'product_url',
+                  'product_description', 'quantity', 'price', 'size', 'color', 'delivery_mode']
 
 
 class OrderSerializer(serializers.ModelSerializer):
     items = OrderItemSerializer(many=True, read_only=True)
     user = UserSerializer(read_only=True)
+    balance_payment_initiated = serializers.SerializerMethodField()
 
     class Meta:
         model = Order
         fields = ['id', 'user', 'tracking_number', 'status', 'payment_status',
-                  'shipping_method', 'total', 'paid_amount', 'shipping_address',
-                  'shipping_fee', 'created_at', 'updated_at', 'items']
+                  'payment_mode', 'shipping_method', 'total', 'amount_due',
+                  'paid_amount', 'shipping_address', 'shipping_fee', 'service_fee',
+                  'admin_notes', 'created_at', 'updated_at', 'items',
+                  'balance_payment_initiated']
+
+    def get_balance_payment_initiated(self, obj):
+        """Vérifie s'il y a un paiement de solde en attente (client a initié via Wave)"""
+        return obj.payments.filter(payment_type='balance', status='pending').exists()
 
 
 class OrderCreateSerializer(serializers.ModelSerializer):
     items = serializers.ListField(child=serializers.DictField(), write_only=True)
+    payment_mode = serializers.ChoiceField(choices=['partial', 'total'], default='total')
 
     class Meta:
         model = Order
-        fields = ['shipping_address', 'shipping_fee', 'shipping_method', 'items']
+        fields = ['shipping_address', 'payment_mode', 'items']
 
     def create(self, validated_data):
         from decimal import Decimal
@@ -117,53 +176,62 @@ class OrderCreateSerializer(serializers.ModelSerializer):
         logger = logging.getLogger(__name__)
 
         items_data = validated_data.pop('items')
+        payment_mode = validated_data.pop('payment_mode', 'total')
 
-        # Récupérer l'utilisateur depuis le context (fourni par la vue)
         request = self.context.get('request')
         user = request.user if request else None
-
-        logger.info(f'OrderCreateSerializer.create - Request: {request}')
-        logger.info(f'OrderCreateSerializer.create - User from context: {user}')
-        logger.info(f'OrderCreateSerializer.create - User authenticated: {user.is_authenticated if user else False}')
 
         if not user or not user.is_authenticated:
             raise serializers.ValidationError("Utilisateur non authentifié")
 
-        logger.info(f'OrderCreateSerializer.create - Création pour user: {user.username} (ID: {user.id})')
+        logger.info(f'OrderCreate - user: {user.username} (ID: {user.id}), payment_mode: {payment_mode}')
 
-        # Calculer le total AVANT de créer la commande
+        # Calculer le total en FCFA
         subtotal = Decimal('0')
+        delivery_modes = set()
         for item_data in items_data:
-            # Utiliser le prix fourni par le frontend
             price = Decimal(str(item_data.get('price', 0)))
             quantity = int(item_data.get('quantity', 1))
             subtotal += price * quantity
+            delivery_modes.add(item_data.get('delivery_mode', 'bateau'))
 
-        # Calculer le total avec les frais de livraison
-        shipping_fee = validated_data.get('shipping_fee', Decimal('0'))
-        if not isinstance(shipping_fee, Decimal):
-            shipping_fee = Decimal(str(shipping_fee))
-        total = subtotal + shipping_fee
+        # Déterminer le shipping_method global
+        if len(delivery_modes) == 1:
+            shipping_method = delivery_modes.pop()
+        else:
+            shipping_method = 'mixte'
 
-        # Créer la commande avec le total calculé
+        # Calculer le montant à payer
+        total = subtotal
+        if payment_mode == 'partial':
+            amount_due = round(total * Decimal('0.7'))
+        else:
+            amount_due = total
+
+        # Créer la commande
         order = Order.objects.create(
             user=user,
             total=total,
-            **validated_data
+            amount_due=amount_due,
+            service_fee=Decimal('0'),
+            payment_mode=payment_mode,
+            shipping_method=shipping_method,
+            shipping_address=validated_data.get('shipping_address', ''),
         )
 
-        # Maintenant créer les items avec les informations du produit statique
+        logger.info(f'Order #{order.tracking_number} créée - total: {total} FCFA, à payer: {amount_due} FCFA')
+
+        # Créer les items
         for item_data in items_data:
             quantity = int(item_data.get('quantity', 1))
             price = Decimal(str(item_data.get('price', 0)))
+            delivery_mode = item_data.get('delivery_mode', 'bateau')
 
-            # Support pour les produits DB (si product_id est fourni)
             product_id = item_data.get('product_id')
             product = None
             if product_id:
                 try:
                     product = Product.objects.get(id=product_id)
-                    # Réduire le stock si c'est un produit de la DB
                     if product.stock < quantity:
                         raise serializers.ValidationError(
                             f"Stock insuffisant pour {product.name}. Disponible: {product.stock}, Demandé: {quantity}"
@@ -173,16 +241,18 @@ class OrderCreateSerializer(serializers.ModelSerializer):
                 except Product.DoesNotExist:
                     product = None
 
-            # Créer l'OrderItem avec les infos du produit statique
             OrderItem.objects.create(
                 order=order,
-                product=product,  # Peut être None pour les produits statiques
+                product=product,
                 product_name=item_data.get('product_name', ''),
                 product_image=item_data.get('product_image', ''),
                 product_url=item_data.get('product_url', ''),
                 product_description=item_data.get('product_description', ''),
                 quantity=quantity,
-                price=price
+                price=price,
+                size=item_data.get('size', ''),
+                color=item_data.get('color', ''),
+                delivery_mode=delivery_mode,
             )
 
         return order

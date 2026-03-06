@@ -1,6 +1,6 @@
 from django.db import models
 from django.contrib.auth.models import AbstractUser
-from django.core.validators import MinValueValidator, MaxValueValidator
+from django.core.validators import MinValueValidator, MaxValueValidator, FileExtensionValidator
 
 
 class User(AbstractUser):
@@ -44,8 +44,19 @@ class User(AbstractUser):
     def save(self, *args, **kwargs):
         # Generate custom_id for clients (KA-[postal_code]-[number])
         if self.user_type == 'client' and not self.custom_id:
-            count = User.objects.filter(postal_code=self.postal_code, user_type='client').count()
-            self.custom_id = f"KA-{self.postal_code}-{str(count + 1).zfill(4)}"
+            prefix = f"KA-{self.postal_code}-"
+            # Find the highest existing number for this postal code
+            existing = User.objects.filter(
+                custom_id__startswith=prefix
+            ).order_by('-custom_id').values_list('custom_id', flat=True).first()
+            if existing:
+                try:
+                    last_num = int(existing.split('-')[-1])
+                except (ValueError, IndexError):
+                    last_num = 0
+            else:
+                last_num = 0
+            self.custom_id = f"{prefix}{str(last_num + 1).zfill(4)}"
         super().save(*args, **kwargs)
 
 
@@ -78,10 +89,31 @@ class Category(models.Model):
     name = models.CharField(max_length=100, unique=True)
     description = models.TextField(blank=True)
     slug = models.SlugField(unique=True)
+    created_at = models.DateTimeField(auto_now_add=True, null=True)
+    updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
         db_table = 'categories'
         verbose_name_plural = 'Categories'
+        ordering = ['name']
+
+    def __str__(self):
+        return self.name
+
+
+class Provenance(models.Model):
+    """Product provenance / origin"""
+    name = models.CharField(max_length=100, unique=True)
+    slug = models.SlugField(unique=True)
+    description = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'provenances'
+        ordering = ['name']
+        verbose_name = 'Provenance'
+        verbose_name_plural = 'Provenances'
 
     def __str__(self):
         return self.name
@@ -89,23 +121,31 @@ class Category(models.Model):
 
 class Product(models.Model):
     """Product model"""
-    ORIGIN_CHOICES = [
-        ('africa', 'Afrique'),
-        ('asia', 'Asie'),
+
+    STATUS_CHOICES = [
+        ('active', 'Actif'),
+        ('promotion', 'En Promotion'),
+        ('unavailable', 'Indisponible'),
     ]
 
-    supplier = models.ForeignKey(Supplier, on_delete=models.CASCADE, related_name='products')
+    supplier = models.ForeignKey(Supplier, on_delete=models.CASCADE, related_name='products', null=True, blank=True)
     category = models.ForeignKey(Category, on_delete=models.SET_NULL, null=True, related_name='products')
     name = models.CharField(max_length=255)
     description = models.TextField()
     price = models.DecimalField(max_digits=10, decimal_places=2, validators=[MinValueValidator(0)])
-    origin = models.CharField(max_length=10, choices=ORIGIN_CHOICES)
+    price_fcfa = models.DecimalField(max_digits=12, decimal_places=0, null=True, blank=True, validators=[MinValueValidator(0)])
+    old_price = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True, validators=[MinValueValidator(0)])
+    old_price_fcfa = models.DecimalField(max_digits=12, decimal_places=0, null=True, blank=True, validators=[MinValueValidator(0)])
+    marketing_price_fcfa = models.DecimalField(max_digits=12, decimal_places=0, null=True, blank=True, validators=[MinValueValidator(0)], help_text='Prix marketing barre en rouge (FCFA)')
+    origin = models.ForeignKey(Provenance, on_delete=models.SET_NULL, null=True, related_name='products')
     country = models.CharField(max_length=100)
     stock = models.IntegerField(validators=[MinValueValidator(0)])
     rating = models.DecimalField(max_digits=3, decimal_places=2, default=0.00)
     reviews_count = models.IntegerField(default=0)
     delivery_time = models.IntegerField(help_text='Délai de livraison en jours')
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='active')
     is_active = models.BooleanField(default=True)
+    video = models.FileField(upload_to='products/videos/', blank=True, null=True, validators=[FileExtensionValidator(['mp4', 'webm'])])
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -115,6 +155,14 @@ class Product(models.Model):
 
     def __str__(self):
         return self.name
+
+    def save(self, *args, **kwargs):
+        # Synchronize is_active from status
+        if self.status in ('active', 'promotion'):
+            self.is_active = True
+        elif self.status == 'unavailable':
+            self.is_active = False
+        super().save(*args, **kwargs)
 
 
 class ProductImage(models.Model):
@@ -135,10 +183,12 @@ class Order(models.Model):
     """Order model"""
     STATUS_CHOICES = [
         ('pending', 'En attente'),
-        ('confirmed', 'Confirmée'),
-        ('shipped', 'Expédiée'),
-        ('delivered', 'Livrée'),
+        ('confirmed', 'Confirmé en préparation'),
+        ('shipped', 'Expédié'),
+        ('available', 'Disponible à Abidjan'),
+        ('delivered', 'Livré'),
         ('cancelled', 'Annulée'),
+        ('refunded', 'Indisponible - Remboursé'),
     ]
 
     PAYMENT_STATUS_CHOICES = [
@@ -147,23 +197,30 @@ class Order(models.Model):
         ('completed', 'Complet'),
     ]
 
+    PAYMENT_MODE_CHOICES = [
+        ('partial', 'Partiel (70%)'),
+        ('total', 'Total (100%)'),
+    ]
+
     SHIPPING_METHOD_CHOICES = [
-        ('air_rapide', 'Aérien Rapide'),
-        ('air_express', 'Aérien Express'),
-        ('sea_no_motor', 'Maritime sans Moteur'),
-        ('sea_with_motor', 'Maritime avec Moteur'),
-        ('local', 'Livraison Locale'),
+        ('bateau', 'Bateau'),
+        ('avion', 'Avion'),
+        ('mixte', 'Mixte'),
     ]
 
     user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='orders')
     tracking_number = models.CharField(max_length=50, unique=True)
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='pending')
     payment_status = models.CharField(max_length=20, choices=PAYMENT_STATUS_CHOICES, default='pending')
-    shipping_method = models.CharField(max_length=20, choices=SHIPPING_METHOD_CHOICES, default='local')
-    total = models.DecimalField(max_digits=10, decimal_places=2)
-    paid_amount = models.DecimalField(max_digits=10, decimal_places=2, default=0)
+    payment_mode = models.CharField(max_length=10, choices=PAYMENT_MODE_CHOICES, default='total')
+    shipping_method = models.CharField(max_length=20, choices=SHIPPING_METHOD_CHOICES, default='bateau')
+    total = models.DecimalField(max_digits=12, decimal_places=0, default=0)
+    amount_due = models.DecimalField(max_digits=12, decimal_places=0, default=0)
+    paid_amount = models.DecimalField(max_digits=12, decimal_places=0, default=0)
     shipping_address = models.TextField()
-    shipping_fee = models.DecimalField(max_digits=10, decimal_places=2, default=0)
+    shipping_fee = models.DecimalField(max_digits=12, decimal_places=0, default=0)
+    service_fee = models.DecimalField(max_digits=12, decimal_places=0, default=0)
+    admin_notes = models.TextField(blank=True, default='')
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -186,6 +243,11 @@ class Order(models.Model):
 
 class OrderItem(models.Model):
     """Order items"""
+    DELIVERY_MODE_CHOICES = [
+        ('bateau', 'Bateau'),
+        ('avion', 'Avion'),
+    ]
+
     order = models.ForeignKey(Order, on_delete=models.CASCADE, related_name='items')
     product = models.ForeignKey(Product, on_delete=models.CASCADE, null=True, blank=True)
 
@@ -196,7 +258,10 @@ class OrderItem(models.Model):
     product_description = models.TextField(blank=True)
 
     quantity = models.IntegerField(validators=[MinValueValidator(1)])
-    price = models.DecimalField(max_digits=10, decimal_places=2)
+    price = models.DecimalField(max_digits=12, decimal_places=0)
+    size = models.CharField(max_length=20, blank=True, default='')
+    color = models.CharField(max_length=50, blank=True, default='')
+    delivery_mode = models.CharField(max_length=10, choices=DELIVERY_MODE_CHOICES, default='bateau')
 
     class Meta:
         db_table = 'order_items'
@@ -215,8 +280,8 @@ class Payment(models.Model):
     ]
 
     PAYMENT_METHOD_CHOICES = [
+        ('wave', 'Wave'),
         ('mobile_money', 'Mobile Money'),
-        ('card', 'Carte Bancaire'),
         ('cash', 'Espèces'),
     ]
 
@@ -227,7 +292,7 @@ class Payment(models.Model):
     ]
 
     order = models.ForeignKey(Order, on_delete=models.CASCADE, related_name='payments')
-    amount = models.DecimalField(max_digits=10, decimal_places=2)
+    amount = models.DecimalField(max_digits=12, decimal_places=0)
     payment_type = models.CharField(max_length=10, choices=PAYMENT_TYPE_CHOICES)
     payment_method = models.CharField(max_length=20, choices=PAYMENT_METHOD_CHOICES)
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='pending')

@@ -1,6 +1,6 @@
 from django.contrib import admin
 from .models import (
-    User, Supplier, Category, Product, ProductImage,
+    User, Supplier, Category, Provenance, Product, ProductImage,
     Order, OrderItem, Payment, Review, QuoteRequest,
     LogisticsRate, ExchangeRate
 )
@@ -22,8 +22,18 @@ class SupplierAdmin(admin.ModelAdmin):
 
 @admin.register(Category)
 class CategoryAdmin(admin.ModelAdmin):
-    list_display = ['name', 'slug']
+    list_display = ['name', 'slug', 'created_at']
+    search_fields = ['name', 'slug']
     prepopulated_fields = {'slug': ('name',)}
+    readonly_fields = ['created_at', 'updated_at']
+
+
+@admin.register(Provenance)
+class ProvenanceAdmin(admin.ModelAdmin):
+    list_display = ['name', 'slug', 'description', 'created_at']
+    search_fields = ['name', 'slug']
+    prepopulated_fields = {'slug': ('name',)}
+    readonly_fields = ['created_at', 'updated_at']
 
 
 class ProductImageInline(admin.TabularInline):
@@ -33,9 +43,10 @@ class ProductImageInline(admin.TabularInline):
 
 @admin.register(Product)
 class ProductAdmin(admin.ModelAdmin):
-    list_display = ['name', 'supplier', 'category', 'price', 'stock', 'origin', 'is_active']
-    list_filter = ['origin', 'category', 'is_active', 'created_at']
+    list_display = ['name', 'supplier', 'category', 'price', 'old_price', 'stock', 'origin', 'status', 'is_active']
+    list_filter = ['status', 'origin', 'category', 'created_at']
     search_fields = ['name', 'description', 'country']
+    readonly_fields = ['is_active']
     inlines = [ProductImageInline]
 
 
